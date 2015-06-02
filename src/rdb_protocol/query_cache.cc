@@ -295,7 +295,7 @@ void query_cache_t::ref_t::run(env_t *env, Response *res) {
             entry->state = entry_t::state_t::STREAM;
         }
     } else {
-        rfail_toplevel(base_exc_t::GENERIC,
+        rfail_toplevel(base_exc_t::LOGIC,
                        "Query result must be of type "
                        "DATUM, GROUPED_DATA, or STREAM (got %s).",
                        val->get_type().name());

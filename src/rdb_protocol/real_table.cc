@@ -163,7 +163,7 @@ ql::datum_t real_table_t::read_nearest(
                 read, &res, order_token_t::ignore, env->interruptor);
         }
     } catch (const cannot_perform_query_exc_t &ex) {
-        rfail_datum(ql::base_exc_t::GENERIC, "Cannot perform read: %s", ex.what());
+        rfail_datum(ql::base_exc_t::OP_FAILED, "Cannot perform read: %s", ex.what());
     }
 
     nearest_geo_read_response_t *g_res =
@@ -397,7 +397,7 @@ void real_table_t::read_with_profile(ql::env_t *env, const read_t &read,
             namespace_access.get()->read_outdated(read, response, env->interruptor);
         }
     } catch (const cannot_perform_query_exc_t &e) {
-        rfail_datum(ql::base_exc_t::GENERIC, "Cannot perform read: %s", e.what());
+        rfail_datum(ql::base_exc_t::OP_FAILED, "Cannot perform read: %s", e.what());
     }
     /* Append the results of the profile to the current task */
     splitter.give_splits(response->n_shards, response->event_log);
@@ -414,7 +414,17 @@ void real_table_t::write_with_profile(ql::env_t *env, write_t *write,
         namespace_access.get()->write(*write, response, order_token_t::ignore,
             env->interruptor);
     } catch (const cannot_perform_query_exc_t &e) {
-        rfail_datum(ql::base_exc_t::GENERIC, "Cannot perform write: %s", e.what());
+        ql::base_exc_t::type_t type;
+        switch (e.get_query_state()) {
+        case query_state_t::FAILED:
+            type = ql::base_exc_t::OP_FAILED;
+            break;
+        case query_state_t::INDETERMINATE:
+            type = ql::base_exc_t::OP_INDETERMINATE;
+            break;
+        default: unreachable();
+        }
+        rfail_datum(type, "Cannot perform write: %s", e.what());
     }
     /* Append the results of the profile to the current task */
     splitter.give_splits(response->n_shards, response->event_log);
