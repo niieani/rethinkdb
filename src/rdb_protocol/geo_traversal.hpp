@@ -37,7 +37,10 @@ class sampler_t;
 
 class geo_job_data_t {
 public:
-    geo_job_data_t(ql::env_t *_env, const ql::batchspec_t &batchspec,
+    geo_job_data_t(ql::env_t *_env,
+                   region_t region,
+                   store_key_t last_key,
+                   const ql::batchspec_t &batchspec,
                    const std::vector<ql::transform_variant_t> &_transforms,
                    const boost::optional<ql::terminal_variant_t> &_terminal);
     geo_job_data_t(geo_job_data_t &&jd)
@@ -49,7 +52,7 @@ public:
 private:
     friend class collect_all_geo_intersecting_cb_t;
     ql::env_t *const env;
-    ql::batcher_t batcher;
+    scoped_ptr_t<ql::batcher_t> batcher;
     std::vector<scoped_ptr_t<ql::op_t> > transformers;
     scoped_ptr_t<ql::accumulator_t> accumulator;
 };
@@ -86,7 +89,7 @@ public:
 
     void init_query(const ql::datum_t &_query_geometry);
 
-    done_traversing_t on_candidate(scoped_key_value_t &&keyvalue,
+    continue_bool_t on_candidate(scoped_key_value_t &&keyvalue,
                                    concurrent_traversal_fifo_enforcer_signal_t waiter)
             THROWS_ONLY(interrupted_exc_t);
 
@@ -96,7 +99,7 @@ protected:
             const ql::datum_t &val)
             THROWS_ONLY(interrupted_exc_t, ql::base_exc_t, geo_exception_t) = 0;
 
-    virtual done_traversing_t emit_result(
+    virtual continue_bool_t emit_result(
             ql::datum_t &&sindex_val,
             store_key_t &&key,
             ql::datum_t &&val)
@@ -134,10 +137,9 @@ public:
             geo_job_data_t &&_job,
             geo_sindex_data_t &&_sindex,
             const ql::datum_t &_query_geometry,
-            const key_range_t &_sindex_range,
             rget_read_response_t *_resp_out);
 
-    void finish() THROWS_ONLY(interrupted_exc_t);
+    void finish(continue_bool_t last_cb) THROWS_ONLY(interrupted_exc_t);
 
 protected:
     bool post_filter(
@@ -145,7 +147,7 @@ protected:
             const ql::datum_t &val)
             THROWS_ONLY(interrupted_exc_t, ql::base_exc_t, geo_exception_t);
 
-    done_traversing_t emit_result(
+    continue_bool_t emit_result(
             ql::datum_t &&sindex_val,
             store_key_t &&key,
             ql::datum_t &&val)
@@ -173,7 +175,7 @@ public:
 
     // Modifies the state such that the next batch will be generated the next
     // time this state is used.
-    done_traversing_t proceed_to_next_batch();
+    continue_bool_t proceed_to_next_batch();
 private:
     friend class nearest_traversal_cb_t;
 
@@ -208,7 +210,7 @@ protected:
             const ql::datum_t &val)
             THROWS_ONLY(interrupted_exc_t, ql::base_exc_t, geo_exception_t);
 
-    done_traversing_t emit_result(
+    continue_bool_t emit_result(
             ql::datum_t &&sindex_val,
             store_key_t &&key,
             ql::datum_t &&val)

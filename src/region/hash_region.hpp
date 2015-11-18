@@ -12,12 +12,28 @@
 
 enum region_join_result_t { REGION_JOIN_OK, REGION_JOIN_BAD_JOIN, REGION_JOIN_BAD_REGION };
 
-struct key_range_t;
+struct btree_key_t;
+class key_range_t;
 struct store_key_t;
 
 // Returns a value in [0, HASH_REGION_HASH_SIZE).
 const uint64_t HASH_REGION_HASH_SIZE = 1ULL << 63;
-uint64_t hash_region_hasher(const uint8_t *s, ssize_t len);
+uint64_t hash_region_hasher(const btree_key_t *key);
+uint64_t hash_region_hasher(const store_key_t &key);
+
+struct hash_range_t {
+    uint64_t beg, end;
+    bool operator<(const hash_range_t &o) const {
+        return (beg < o.beg)
+            ? true
+            : ((beg > o.beg)
+               ? false
+               : end < o.end);
+    }
+    bool contains(uint64_t val) const {
+        return beg <= val && val < end;
+    }
+};
 
 // Forms a region that shards an inner_region_t by a different
 // dimension: hash values, which are computed by the function
@@ -244,8 +260,11 @@ bool operator!=(const hash_region_t<inner_region_t> &r1,
 
 // Used for making std::sets of hash_region_t.
 template <class inner_region_t>
-bool operator<(const hash_region_t<inner_region_t> &r1, const hash_region_t<inner_region_t> &r2) {
-    return (r1.beg < r2.beg || (r1.beg == r2.beg && (r1.end < r2.end || (r1.end == r2.end && r1.inner < r2.inner))));
+bool operator<(const hash_region_t<inner_region_t> &r1,
+               const hash_region_t<inner_region_t> &r2) {
+    return (r1.beg < r2.beg
+            || (r1.beg == r2.beg
+                && (r1.end < r2.end || (r1.end == r2.end && r1.inner < r2.inner))));
 }
 
 

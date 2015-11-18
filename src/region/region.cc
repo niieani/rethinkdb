@@ -3,6 +3,10 @@
 
 #include <algorithm>
 
+void debug_print(printf_buffer_t *buf, const hash_range_t &hr) {
+    buf->appendf("hash_range_t(%" PRIx64 ", %" PRIx64 ")", hr.beg, hr.end);
+}
+
 bool compare_range_by_left(const key_range_t &r1, const key_range_t &r2) {
     return r1.left < r2.left;
 }
@@ -46,7 +50,9 @@ std::vector<key_range_t> region_subtract_many(key_range_t minuend, const std::ve
                 temp_result_buf.push_back(left);
             }
             if (!s->right.unbounded) {
-                key_range_t right = region_intersection(*m, key_range_t(key_range_t::closed, s->right.key, key_range_t::none, store_key_t()));
+                key_range_t right = region_intersection(*m, key_range_t(
+                        key_range_t::closed, s->right.key(),
+                        key_range_t::none, store_key_t()));
 
                 if (!right.is_empty()) {
                     temp_result_buf.push_back(right);

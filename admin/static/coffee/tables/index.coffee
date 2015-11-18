@@ -79,10 +79,10 @@ class DatabasesContainer extends Backbone.View
             tables: r.db(system_db).table('table_status').orderBy((table) -> table("name"))
                 .filter({db: db("name")})
                 .merge( (table) ->
-                    shards: table("shards").count()
-                    replicas: table("shards").map((shard) ->
+                    shards: table("shards").count().default(0)
+                    replicas: table("shards").default([]).map((shard) ->
                         shard('replicas').count()).sum()
-                    replicas_ready: table('shards').map((shard) ->
+                    replicas_ready: table('shards').default([]).map((shard) ->
                         shard('replicas').filter((replica) ->
                             replica('state').eq('ready')).count()).sum()
                     status: table('status')
@@ -134,10 +134,10 @@ class DatabasesListView extends Backbone.View
             @databases_view.push view
             @$el.append view.render().$el
 
-        if @container.loading
-            @$el.html @template.loading_databases()
-        else if @collection.length is 0
+        if @collection.length is 0
             @$el.html @template.no_databases()
+        else if @container.loading
+            @$el.html @template.loading_databases()
 
         @listenTo @collection, 'add', (database) =>
             new_view = new DatabaseView

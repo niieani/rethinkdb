@@ -10,9 +10,10 @@
 #include "containers/uuid.hpp"
 #include "unittest/unittest_utils.hpp"
 #include "rdb_protocol/btree.hpp"
+#include "rdb_protocol/datum.hpp"
 #include "rdb_protocol/store.hpp"
 #include "rdb_protocol/protocol.hpp"
-#include "serializer/config.hpp"
+#include "serializer/log/log_serializer.hpp"
 
 namespace unittest {
 
@@ -23,12 +24,12 @@ TPTEST(BTreeSindex, LowLevelOps) {
     dummy_cache_balancer_t balancer(GIGABYTE);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
-    standard_serializer_t::create(
+    log_serializer_t::create(
         &file_opener,
-        standard_serializer_t::static_config_t());
+        log_serializer_t::static_config_t());
 
-    standard_serializer_t serializer(
-        standard_serializer_t::dynamic_config_t(),
+    log_serializer_t serializer(
+        log_serializer_t::dynamic_config_t(),
         &file_opener,
         &get_global_perfmon_collection());
 
@@ -126,16 +127,17 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
     dummy_cache_balancer_t balancer(GIGABYTE);
 
     filepath_file_opener_t file_opener(temp_file.name(), &io_backender);
-    standard_serializer_t::create(
+    log_serializer_t::create(
         &file_opener,
-        standard_serializer_t::static_config_t());
+        log_serializer_t::static_config_t());
 
-    standard_serializer_t serializer(
-        standard_serializer_t::dynamic_config_t(),
+    log_serializer_t serializer(
+        log_serializer_t::dynamic_config_t(),
         &file_opener,
         &get_global_perfmon_collection());
 
     store_t store(
+            region_t::universe(),
             &serializer,
             &balancer,
             "unit_test_store",
@@ -144,8 +146,8 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
             NULL,
             &io_backender,
             base_path_t("."),
-            scoped_ptr_t<outdated_index_report_t>(),
-            generate_uuid());
+            generate_uuid(),
+            update_sindexes_t::UPDATE);
 
     cond_t dummy_interruptor;
 
@@ -154,6 +156,7 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
     for (int i = 0; i < 50; ++i) {
         sindex_name_t name = sindex_name_t(uuid_to_str(generate_uuid()));
         created_sindexs.insert(name);
+        boost::optional<uuid_u> index_id;
         {
             write_token_t token;
             store.new_write_token(&token);
@@ -169,7 +172,9 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
                                     super_block->get_sindex_block_id(),
                                     access_t::write);
 
-            UNUSED bool b = store.add_sindex(name, std::vector<char>(), &sindex_block);
+            index_id = store.add_sindex_internal(
+                name, std::vector<char>(), &sindex_block);
+            guarantee(index_id);
         }
 
         {
@@ -186,8 +191,14 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
                                     super_block->get_sindex_block_id(),
                                     access_t::write);
 
-            store.mark_index_up_to_date(name, &sindex_block);
+            store.mark_index_up_to_date(*index_id, &sindex_block, key_range_t::empty());
         }
+
+        store_key_t key(ql::datum_t::compose_secondary(
+                ql::skey_version_t::post_1_16,
+                "sec",
+                store_key_t("pri"),
+                boost::none));
 
         {
             //Insert a piece of data in to the btree.
@@ -218,7 +229,6 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
             point_write_response_t response;
             rdb_modification_info_t mod_info;
 
-            store_key_t key("foo");
             rdb_live_deletion_context_t deletion_context;
             rdb_set(key, data, true, store.get_sindex_slice(sindex_uuid),
                     repli_timestamp_t::distant_past,
@@ -239,8 +249,6 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
             store.acquire_superblock_for_read(
                     &token, &txn, &main_sb,
                     &dummy_interruptor, true);
-
-            store_key_t key("foo");
 
             {
                 std::vector<char> opaque_definition;
@@ -265,20 +273,8 @@ TPTEST(BTreeSindex, BtreeStoreAPI) {
 
     for (auto it  = created_sindexs.begin(); it != created_sindexs.end(); ++it) {
         /* Drop the sindex */
-        write_token_t token;
-        store.new_write_token(&token);
-
-        scoped_ptr_t<txn_t> txn;
-        scoped_ptr_t<real_superblock_t> super_block;
-
-        store.acquire_superblock_for_write(1, write_durability_t::SOFT, &token,
-                                           &txn, &super_block, &dummy_interruptor);
-
-        buf_lock_t sindex_block(super_block->expose_buf(),
-                                super_block->get_sindex_block_id(),
-                                access_t::write);
-
-        store.drop_sindex(*it, &sindex_block);
+        cond_t non_interruptor;
+        store.sindex_drop(it->name, &non_interruptor);
     }
 }
 

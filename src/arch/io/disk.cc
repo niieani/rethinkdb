@@ -81,16 +81,11 @@ public:
         return new accounting_diskmgr_t::account_t(&accounter, pri, outstanding_requests_limit);
     }
 
-    void delayed_destroy(void *_account) {
-        on_thread_t t(home_thread());
-
-        // The account destructor can block if there are outstanding requests.
-        delete static_cast<accounting_diskmgr_t::account_t *>(_account);
-    }
-
     void destroy_account(void *account) {
-        coro_t::spawn_sometime(std::bind(&linux_disk_manager_t::delayed_destroy, this,
-                                         account));
+        coro_t::spawn_on_thread([account] {
+            // The account destructor can block if there are outstanding requests.
+            delete static_cast<accounting_diskmgr_t::account_t *>(account);
+        }, home_thread());
     }
 
     void submit_action_to_stack_stats(action_t *a) {
@@ -537,29 +532,6 @@ void crash_due_to_inaccessible_database_file(const char *path, file_open_result_
 #endif
         , path, errno_string(open_res.errsv).c_str());
 }
-
-linux_semantic_checking_file_t::linux_semantic_checking_file_t(int fd) : fd_(fd) { }
-
-size_t linux_semantic_checking_file_t::semantic_blocking_read(void *buf,
-                                                              size_t length) {
-    ssize_t res;
-    do {
-        res = ::read(fd_.get(), buf, length);
-    } while (res == -1 && get_errno() == EINTR);
-    guarantee_err(res != -1, "Could not read from the semantic checker file");
-    return res;
-}
-
-size_t linux_semantic_checking_file_t::semantic_blocking_write(const void *buf,
-                                                               size_t length) {
-    ssize_t res;
-    do {
-        res = ::write(fd_.get(), buf, length);
-    } while (res == -1 && get_errno() == EINTR);
-    guarantee_err(res != -1, "Could not write to the semantic checker file");
-    return res;
-}
-
 
 // Upon error, returns the errno value.
 int perform_datasync(fd_t fd) {

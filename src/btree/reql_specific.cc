@@ -21,12 +21,27 @@ struct reql_btree_superblock_t {
                                                                - sizeof(sindex_block);
 
     char metainfo_blob[METAINFO_BLOB_MAXREFLEN];
-
-    static const block_magic_t expected_magic;
 } __attribute__((__packed__));
+
 static const uint32_t REQL_BTREE_SUPERBLOCK_SIZE = sizeof(reql_btree_superblock_t);
 
-const block_magic_t reql_btree_superblock_t::expected_magic = { { 's', 'u', 'p', 'e' } };
+template <cluster_version_t>
+struct reql_btree_version_magic_t {
+    static const block_magic_t value;
+};
+
+// All pre-2.1 values are the same, so we treat them all as v2.0.x
+// Versions pre-2.1 store version_range_ts in their metainfo
+template <>
+const block_magic_t
+    reql_btree_version_magic_t<cluster_version_t::v2_0>::value =
+        { { 's', 'u', 'p', 'e' } };
+
+// Versions post-2.1 store version_ts in their metainfo
+template <>
+const block_magic_t
+    reql_btree_version_magic_t<cluster_version_t::v2_1>::value =
+        { { 's', 'u', 'p', 'f' } };
 
 void btree_superblock_ct_asserts() {
     // Just some place to put the CT_ASSERTs
@@ -136,12 +151,13 @@ void btree_slice_t::init_real_superblock(real_superblock_t *superblock,
     // Properly zero the superblock, zeroing sb->metainfo_blob, in particular.
     memset(sb, 0, REQL_BTREE_SUPERBLOCK_SIZE);
 
-    sb->magic = reql_btree_superblock_t::expected_magic;
+    sb->magic = reql_btree_version_magic_t<cluster_version_t::v2_1>::value;
     sb->root_block = NULL_BLOCK_ID;
     sb->stat_block = create_stat_block(buf_parent_t(superblock->get()->txn()));
     sb->sindex_block = NULL_BLOCK_ID;
 
-    set_superblock_metainfo(superblock, metainfo_key, metainfo_value);
+    set_superblock_metainfo(superblock, metainfo_key, metainfo_value,
+                            cluster_version_t::v2_1);
 
     buf_lock_t sindex_block(superblock->get(), alt_create_t::create);
     initialize_secondary_indexes(&sindex_block);
@@ -156,7 +172,7 @@ void btree_slice_t::init_sindex_superblock(sindex_superblock_t *superblock) {
     // Properly zero the superblock, zeroing sb->metainfo_blob, in particular.
     memset(sb, 0, REQL_BTREE_SUPERBLOCK_SIZE);
 
-    sb->magic = reql_btree_superblock_t::expected_magic;
+    sb->magic = reql_btree_version_magic_t<cluster_version_t::v2_1>::value;
     sb->root_block = NULL_BLOCK_ID;
     sb->stat_block = NULL_BLOCK_ID;
     sb->sindex_block = NULL_BLOCK_ID;
@@ -171,21 +187,6 @@ btree_slice_t::btree_slice_t(cache_t *c, perfmon_collection_t *parent,
       backfill_account_(cache()->create_cache_account(BACKFILL_CACHE_PRIORITY)) { }
 
 btree_slice_t::~btree_slice_t() { }
-
-bool find_superblock_metainfo_entry(char *beg, char *end, const std::vector<char> &key, char **verybeg_ptr_out,  uint32_t **size_ptr_out, char **beg_ptr_out, char **end_ptr_out) {
-    superblock_metainfo_iterator_t::sz_t len = static_cast<superblock_metainfo_iterator_t::sz_t>(key.size());
-    for (superblock_metainfo_iterator_t kv_iter(beg, end); !kv_iter.is_end(); ++kv_iter) {
-        const superblock_metainfo_iterator_t::key_t& cur_key = kv_iter.key();
-        if (len == cur_key.first && std::equal(key.begin(), key.end(), cur_key.second)) {
-            *verybeg_ptr_out = kv_iter.record_ptr();
-            *size_ptr_out = kv_iter.value_size_ptr();
-            *beg_ptr_out = kv_iter.value().second;
-            *end_ptr_out = kv_iter.next_record_ptr();
-            return true;
-        }
-    }
-    return false;
-}
 
 void superblock_metainfo_iterator_t::advance(char * p) {
     char* cur = p;
@@ -237,51 +238,10 @@ void superblock_metainfo_iterator_t::operator++() {
     }
 }
 
-bool get_superblock_metainfo(real_superblock_t *superblock,
-                             const std::vector<char> &key,
-                             std::vector<char> *value_out) {
-    std::vector<char> metainfo;
-
-    {
-        buf_read_t read(superblock->get());
-        uint32_t sb_size;
-        const reql_btree_superblock_t *data
-            = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
-        guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
-
-        // The const cast is okay because we access the data with access_t::read.
-        blob_t blob(superblock->get()->cache()->max_block_size(),
-                    const_cast<char *>(data->metainfo_blob),
-                    reql_btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
-
-        blob_acq_t acq;
-        buffer_group_t group;
-        blob.expose_all(buf_parent_t(superblock->get()), access_t::read, &group, &acq);
-
-        int64_t group_size = group.get_size();
-        metainfo.resize(group_size);
-        buffer_group_t group_cpy;
-        group_cpy.add_buffer(group_size, metainfo.data());
-
-        buffer_group_copy_data(&group_cpy, const_view(&group));
-    }
-
-    uint32_t *size;
-    char *verybeg, *info_begin, *info_end;
-    if (find_superblock_metainfo_entry(metainfo.data(),
-                                       metainfo.data() + metainfo.size(),
-                                       key, &verybeg, &size,
-                                       &info_begin, &info_end)) {
-        value_out->assign(info_begin, info_end);
-        return true;
-    } else {
-        return false;
-    }
-}
-
 void get_superblock_metainfo(
         real_superblock_t *superblock,
-        std::vector<std::pair<std::vector<char>, std::vector<char> > > *kv_pairs_out) {
+        std::vector<std::pair<std::vector<char>, std::vector<char> > > *kv_pairs_out,
+        cluster_version_t *version_out) {
     std::vector<char> metainfo;
     {
         buf_read_t read(superblock->get());
@@ -289,6 +249,14 @@ void get_superblock_metainfo(
         const reql_btree_superblock_t *data
             = static_cast<const reql_btree_superblock_t *>(read.get_data_read(&sb_size));
         guarantee(sb_size == REQL_BTREE_SUPERBLOCK_SIZE);
+
+        if (data->magic == reql_btree_version_magic_t<cluster_version_t::v2_1>::value) {
+            *version_out = cluster_version_t::v2_1;
+        } else if (data->magic == reql_btree_version_magic_t<cluster_version_t::v2_0>::value) {
+            *version_out = cluster_version_t::v2_0;
+        } else {
+            crash("Unrecognized reql_btree_superblock_t::magic found.");
+        }
 
         // The const cast is okay because we access the data with access_t::read
         // and don't write to the blob.
@@ -318,84 +286,56 @@ void get_superblock_metainfo(
 
 void set_superblock_metainfo(real_superblock_t *superblock,
                              const std::vector<char> &key,
-                             const binary_blob_t &value) {
+                             const binary_blob_t &value,
+                             cluster_version_t version) {
     std::vector<std::vector<char> > keys = {key};
     std::vector<binary_blob_t> values = {value};
-    set_superblock_metainfo(superblock, keys, values);
+    set_superblock_metainfo(superblock, keys, values, version);
 }
 
 void set_superblock_metainfo(real_superblock_t *superblock,
                              const std::vector<std::vector<char> > &keys,
-                             const std::vector<binary_blob_t> &values) {
+                             const std::vector<binary_blob_t> &values,
+                             cluster_version_t version) {
     buf_write_t write(superblock->get());
     reql_btree_superblock_t *data
         = static_cast<reql_btree_superblock_t *>(
             write.get_data_write(REQL_BTREE_SUPERBLOCK_SIZE));
 
+    if (version == cluster_version_t::v2_0) {
+        data->magic = reql_btree_version_magic_t<cluster_version_t::v2_0>::value;
+    } else if (version == cluster_version_t::v2_1) {
+        data->magic = reql_btree_version_magic_t<cluster_version_t::v2_1>::value;
+    } else {
+        crash("Unsupported version when writing metainfo.");
+    }
+
     blob_t blob(superblock->get()->cache()->max_block_size(),
                 data->metainfo_blob, reql_btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
+    blob.clear(buf_parent_t(superblock->get()));
 
     std::vector<char> metainfo;
 
-    {
-        blob_acq_t acq;
-        buffer_group_t group;
-        blob.expose_all(buf_parent_t(superblock->get()), access_t::read,
-                        &group, &acq);
-
-        int64_t group_size = group.get_size();
-        metainfo.resize(group_size);
-
-        buffer_group_t group_cpy;
-        group_cpy.add_buffer(group_size, metainfo.data());
-
-        buffer_group_copy_data(&group_cpy, const_view(&group));
-    }
-
-    blob.clear(buf_parent_t(superblock->get()));
-
     rassert(keys.size() == values.size());
     auto value_it = values.begin();
-    for (auto key_it = keys.begin();
-         key_it != keys.end();
-         ++key_it, ++value_it) {
-        uint32_t *size;
-        char *verybeg, *info_begin, *info_end;
-        const bool found_entry =
-            find_superblock_metainfo_entry(metainfo.data(),
-                                           metainfo.data() + metainfo.size(),
-                                           *key_it, &verybeg, &size,
-                                           &info_begin, &info_end);
-        if (found_entry) {
-            std::vector<char>::iterator beg = metainfo.begin() + (info_begin - metainfo.data());
-            std::vector<char>::iterator end = metainfo.begin() + (info_end - metainfo.data());
-            // We must modify *size first because resizing the vector invalidates the pointer.
-            rassert(value_it->size() <= UINT32_MAX);
-            *size = value_it->size();
+    for (auto key_it = keys.begin(); key_it != keys.end(); ++key_it, ++value_it) {
+        union {
+            char x[sizeof(uint32_t)];
+            uint32_t y;
+        } u;
+        rassert(key_it->size() < UINT32_MAX);
+        rassert(value_it->size() < UINT32_MAX);
 
-            std::vector<char>::iterator p = metainfo.erase(beg, end);
+        u.y = key_it->size();
+        metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
+        metainfo.insert(metainfo.end(), key_it->begin(), key_it->end());
 
-            metainfo.insert(p, static_cast<const uint8_t *>(value_it->data()),
-                            static_cast<const uint8_t *>(value_it->data())
-                                + value_it->size());
-        } else {
-            union {
-                char x[sizeof(uint32_t)];
-                uint32_t y;
-            } u;
-            rassert(key_it->size() < UINT32_MAX);
-            rassert(value_it->size() < UINT32_MAX);
-
-            u.y = key_it->size();
-            metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
-            metainfo.insert(metainfo.end(), key_it->begin(), key_it->end());
-
-            u.y = value_it->size();
-            metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
-            metainfo.insert(metainfo.end(), static_cast<const uint8_t *>(value_it->data()),
-                            static_cast<const uint8_t *>(value_it->data())
-                                + value_it->size());
-        }
+        u.y = value_it->size();
+        metainfo.insert(metainfo.end(), u.x, u.x + sizeof(uint32_t));
+        metainfo.insert(
+            metainfo.end(),
+            static_cast<const uint8_t *>(value_it->data()),
+            static_cast<const uint8_t *>(value_it->data()) + value_it->size());
     }
 
     blob.append_region(buf_parent_t(superblock->get()), metainfo.size());
@@ -412,75 +352,6 @@ void set_superblock_metainfo(real_superblock_t *superblock,
         buffer_group_copy_data(&write_group, const_view(&group_cpy));
     }
 }
-
-void delete_superblock_metainfo(real_superblock_t *superblock,
-                                const std::vector<char> &key) {
-    buf_write_t write(superblock->get());
-    reql_btree_superblock_t *const data
-        = static_cast<reql_btree_superblock_t *>(
-            write.get_data_write(REQL_BTREE_SUPERBLOCK_SIZE));
-
-    blob_t blob(superblock->get()->cache()->max_block_size(),
-                data->metainfo_blob, reql_btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
-
-    std::vector<char> metainfo;
-
-    {
-        blob_acq_t acq;
-        buffer_group_t group;
-        blob.expose_all(buf_parent_t(superblock->get()), access_t::read,
-                        &group, &acq);
-
-        int64_t group_size = group.get_size();
-        metainfo.resize(group_size);
-
-        buffer_group_t group_cpy;
-        group_cpy.add_buffer(group_size, metainfo.data());
-
-        buffer_group_copy_data(&group_cpy, const_view(&group));
-    }
-
-    blob.clear(buf_parent_t(superblock->get()));
-
-    uint32_t *size;
-    char *verybeg, *info_begin, *info_end;
-    bool found = find_superblock_metainfo_entry(metainfo.data(), metainfo.data() + metainfo.size(), key, &verybeg, &size, &info_begin, &info_end);
-
-    rassert(found);
-
-    if (found) {
-
-        std::vector<char>::iterator p = metainfo.begin() + (verybeg - metainfo.data());
-        std::vector<char>::iterator q = metainfo.begin() + (info_end - metainfo.data());
-        metainfo.erase(p, q);
-
-        blob.append_region(buf_parent_t(superblock->get()), metainfo.size());
-
-        {
-            blob_acq_t acq;
-            buffer_group_t write_group;
-            blob.expose_all(buf_parent_t(superblock->get()), access_t::write,
-                            &write_group, &acq);
-
-            buffer_group_t group_cpy;
-            group_cpy.add_buffer(metainfo.size(), metainfo.data());
-
-            buffer_group_copy_data(&write_group, const_view(&group_cpy));
-        }
-    }
-}
-
-void clear_superblock_metainfo(real_superblock_t *superblock) {
-    buf_write_t write(superblock->get());
-    auto data
-        = static_cast<reql_btree_superblock_t *>(
-            write.get_data_write(REQL_BTREE_SUPERBLOCK_SIZE));
-    blob_t blob(superblock->get()->cache()->max_block_size(),
-                data->metainfo_blob,
-                reql_btree_superblock_t::METAINFO_BLOB_MAXREFLEN);
-    blob.clear(buf_parent_t(superblock->get()));
-}
-
 
 void get_btree_superblock(
         txn_t *txn,

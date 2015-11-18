@@ -31,9 +31,12 @@ public:
         return row;
     }
     virtual counted_t<datum_stream_t> read_changes(
-        bool include_initial_vals, const datum_t &squash, bool include_states) {
+        bool include_initial,
+        configured_limits_t limits,
+        const datum_t &squash,
+        bool include_states) {
         counted_t<datum_stream_t> maybe_src;
-        if (include_initial_vals) {
+        if (include_initial) {
             // We want to provide an empty stream in this case because we get
             // the initial values from the stamp read instead.
             maybe_src = make_counted<vector_datum_stream_t>(
@@ -42,6 +45,7 @@ public:
         return tbl->tbl->read_changes(
             env,
             maybe_src,
+            std::move(limits),
             squash,
             include_states,
             changefeed::keyspec_t::point_t{key},
@@ -54,7 +58,7 @@ public:
         std::vector<datum_t > keys{key};
         // We don't need to fetch the value for deterministic replacements.
         std::vector<datum_t > vals{
-            f->is_deterministic() ? datum_t() : get()};
+            f->is_deterministic() == deterministic_t::always ? datum_t() : get()};
         return tbl->batched_replace(
             env, vals, keys, f, nondet_ok, dur_req, return_changes);
     }
@@ -81,17 +85,20 @@ public:
             batchspec_t batchspec = batchspec_t::all().with_at_most(1);
             row = slice->as_seq(env, bt)->next(env, batchspec);
             if (!row.has()) {
-                rfail_src(bt, base_exc_t::GENERIC, "%s", err.c_str());
+                rfail_src(bt, base_exc_t::LOGIC, "%s", err.c_str());
             }
         }
         return row;
     }
     virtual counted_t<datum_stream_t> read_changes(
-        bool include_initial_vals, const datum_t &squash, bool include_states) {
+        bool include_initial,
+        configured_limits_t limits,
+        const datum_t &squash,
+        bool include_states) {
         changefeed::keyspec_t::spec_t spec =
             ql::changefeed::keyspec_t::limit_t{slice->get_range_spec(), 1};
         counted_t<datum_stream_t> maybe_src;
-        if (include_initial_vals) {
+        if (include_initial) {
             // We want to provide an empty stream in this case because we get
             // the initial values from the stamp read instead.
             maybe_src = make_counted<vector_datum_stream_t>(
@@ -100,6 +107,7 @@ public:
         auto s = slice->get_tbl()->tbl->read_changes(
             env,
             maybe_src,
+            std::move(limits),
             squash,
             include_states,
             std::move(spec),
@@ -169,11 +177,11 @@ counted_t<datum_stream_t> table_slice_t::as_seq(
 
 counted_t<table_slice_t>
 table_slice_t::with_sorting(std::string _idx, sorting_t _sorting) {
-    rcheck(sorting == sorting_t::UNORDERED, base_exc_t::GENERIC,
+    rcheck(sorting == sorting_t::UNORDERED, base_exc_t::LOGIC,
            "Cannot perform multiple indexed ORDER_BYs on the same table.");
     bool idx_legal = idx ? (*idx == _idx) : true;
     r_sanity_check(idx_legal || !bounds.is_universe());
-    rcheck(idx_legal, base_exc_t::GENERIC,
+    rcheck(idx_legal, base_exc_t::LOGIC,
            strprintf("Cannot order by index `%s` after calling BETWEEN on index `%s`.",
                      _idx.c_str(), (*idx).c_str()));
     return make_counted<table_slice_t>(tbl, std::move(_idx), _sorting, bounds);
@@ -181,11 +189,11 @@ table_slice_t::with_sorting(std::string _idx, sorting_t _sorting) {
 
 counted_t<table_slice_t>
 table_slice_t::with_bounds(std::string _idx, datum_range_t _bounds) {
-    rcheck(bounds.is_universe(), base_exc_t::GENERIC,
+    rcheck(bounds.is_universe(), base_exc_t::LOGIC,
            "Cannot perform multiple BETWEENs on the same table.");
     bool idx_legal = idx ? (*idx == _idx) : true;
     r_sanity_check(idx_legal || sorting != sorting_t::UNORDERED);
-    rcheck(idx_legal, base_exc_t::GENERIC,
+    rcheck(idx_legal, base_exc_t::LOGIC,
            strprintf("Cannot call BETWEEN on index `%s` after ordering on index `%s`.",
                      _idx.c_str(), (*idx).c_str()));
     return make_counted<table_slice_t>(
@@ -197,7 +205,7 @@ ql::changefeed::keyspec_t::range_t table_slice_t::get_range_spec() {
         std::vector<transform_variant_t>(),
         idx && *idx == tbl->get_pkey() ? boost::none : idx,
         sorting,
-        bounds};
+        datumspec_t(bounds)};
 }
 
 counted_t<datum_stream_t> table_t::as_seq(
@@ -206,17 +214,24 @@ counted_t<datum_stream_t> table_t::as_seq(
     backtrace_id_t bt,
     const datum_range_t &bounds,
     sorting_t sorting) {
-    return tbl->read_all(env, idx, bt, display_name(), bounds, sorting, use_outdated);
+    return tbl->read_all(
+        env,
+        idx,
+        bt,
+        display_name(),
+        datumspec_t(bounds),
+        sorting,
+        read_mode);
 }
 
 table_t::table_t(counted_t<base_table_t> &&_tbl,
                  counted_t<const db_t> _db, const std::string &_name,
-                 bool _use_outdated, backtrace_id_t backtrace)
+                 read_mode_t _read_mode, backtrace_id_t backtrace)
     : bt_rcheckable_t(backtrace),
       db(_db),
       name(_name),
       tbl(std::move(_tbl)),
-      use_outdated(_use_outdated)
+      read_mode(_read_mode)
 { }
 
 datum_t table_t::make_error_datum(const base_exc_t &exception) {
@@ -239,7 +254,7 @@ datum_t table_t::batched_replace(
         return ql::datum_t::empty_object();
     }
 
-    if (!replacement_generator->is_deterministic()) {
+    if (replacement_generator->is_deterministic() != deterministic_t::always) {
         r_sanity_check(nondeterministic_replacements_ok);
         datum_object_builder_t stats;
         std::vector<datum_t> replacement_values;
@@ -317,56 +332,6 @@ datum_t table_t::batched_insert(
     return std::move(result).to_datum();
 }
 
-MUST_USE bool table_t::sindex_create(env_t *env,
-                                     const std::string &id,
-                                     counted_t<const func_t> index_func,
-                                     sindex_multi_bool_t multi,
-                                     sindex_geo_bool_t geo) {
-    index_func->assert_deterministic("Index functions must be deterministic.");
-    return tbl->sindex_create(env, id, index_func, multi, geo);
-}
-
-MUST_USE bool table_t::sindex_drop(env_t *env, const std::string &id) {
-    return tbl->sindex_drop(env, id);
-}
-
-MUST_USE sindex_rename_result_t table_t::sindex_rename(env_t *env,
-                                                       const std::string &old_name,
-                                                       const std::string &new_name,
-                                                       bool overwrite) {
-    return tbl->sindex_rename(env, old_name, new_name, overwrite);
-}
-
-datum_t table_t::sindex_list(env_t *env) {
-    std::vector<std::string> sindexes = tbl->sindex_list(env, use_outdated);
-    std::vector<datum_t> array;
-    array.reserve(sindexes.size());
-    for (std::vector<std::string>::const_iterator it = sindexes.begin();
-         it != sindexes.end(); ++it) {
-        array.push_back(datum_t(datum_string_t(*it)));
-    }
-    return datum_t(std::move(array), env->limits());
-}
-
-datum_t table_t::sindex_status(env_t *env,
-        std::set<std::string> sindexes) {
-    std::map<std::string, datum_t> statuses = tbl->sindex_status(env, sindexes);
-    std::vector<datum_t> array;
-    for (auto it = statuses.begin(); it != statuses.end(); ++it) {
-        r_sanity_check(std_contains(sindexes, it->first) || sindexes.empty());
-        sindexes.erase(it->first);
-        datum_object_builder_t status(it->second);
-        datum_string_t index_name(it->first);
-        status.overwrite("index", datum_t(std::move(index_name)));
-        array.push_back(std::move(status).to_datum());
-    }
-    rcheck(sindexes.empty(), base_exc_t::GENERIC,
-           strprintf("Index `%s` was not found on table `%s`.",
-                     sindexes.begin()->c_str(),
-                     display_name().c_str()));
-    return datum_t(std::move(array), env->limits());
-}
-
 MUST_USE bool table_t::sync(env_t *env) {
     // In order to get the guarantees that we expect from a user-facing command,
     // we always have to use hard durability in combination with sync.
@@ -388,12 +353,12 @@ const std::string &table_t::get_pkey() const {
 }
 
 datum_t table_t::get_row(env_t *env, datum_t pval) {
-    return tbl->read_row(env, pval, use_outdated);
+    return tbl->read_row(env, pval, read_mode);
 }
 
 counted_t<datum_stream_t> table_t::get_all(
         env_t *env,
-        datum_t value,
+        const datumspec_t &datumspec,
         const std::string &get_all_sindex_id,
         backtrace_id_t bt) {
     return tbl->read_all(
@@ -401,9 +366,9 @@ counted_t<datum_stream_t> table_t::get_all(
         get_all_sindex_id,
         bt,
         display_name(),
-        datum_range_t(value),
+        datumspec,
         sorting_t::UNORDERED,
-        use_outdated);
+        read_mode);
 }
 
 counted_t<datum_stream_t> table_t::get_intersecting(
@@ -416,7 +381,7 @@ counted_t<datum_stream_t> table_t::get_intersecting(
         new_sindex_id,
         parent->backtrace(),
         display_name(),
-        use_outdated,
+        read_mode,
         query_geometry);
 }
 
@@ -433,7 +398,7 @@ datum_t table_t::get_nearest(
         env,
         new_sindex_id,
         display_name(),
-        use_outdated,
+        read_mode,
         center,
         max_dist,
         max_results,

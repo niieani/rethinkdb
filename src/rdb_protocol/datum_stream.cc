@@ -1,4 +1,4 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/datum_stream.hpp"
 
 #include <map>
@@ -15,24 +15,451 @@
 
 namespace ql {
 
-bool changespec_t::include_initial_vals() {
-    if (auto *range = boost::get<changefeed::keyspec_t::range_t>(&keyspec.spec)) {
-        if (range->range.is_universe()) return false;
+read_mode_t up_to_date_read_mode(read_mode_t in) {
+    switch (in) {
+    case read_mode_t::MAJORITY: return in;
+    case read_mode_t::SINGLE:   return in;
+    case read_mode_t::OUTDATED: return read_mode_t::SINGLE;
+    case read_mode_t::DEBUG_DIRECT:
+        rfail_datum(base_exc_t::LOGIC,
+                    "DEBUG_DIRECT is not a legal read mode for this operation "
+                    "(an up-to-date read mode is required).");
+    default: unreachable();
+    }
+}
+
+key_range_t safe_universe() {
+    return key_range_t(key_range_t::closed, store_key_t::min(),
+                       key_range_t::open, store_key_t::max());
+}
+
+void debug_print(printf_buffer_t *buf, const range_state_t &rs) {
+    const char *s;
+    switch (rs) {
+    case range_state_t::ACTIVE:    s = "ACTIVE"; break;
+    case range_state_t::SATURATED: s = "SATURATED"; break;
+    case range_state_t::EXHAUSTED: s = "EXHAUSTED"; break;
+    default: unreachable();
+    }
+    buf->appendf("%s", s);
+}
+
+void debug_print(printf_buffer_t *buf, const hash_range_with_cache_t &hrwc) {
+    buf->appendf("hash_range_with_cache_t(");
+    debug_print(buf, hrwc.key_range);
+    buf->appendf(", ");
+    debug_print(buf, hrwc.cache);
+    buf->appendf(", ");
+    debug_print(buf, hrwc.state);
+    buf->appendf(")\n");
+}
+
+void debug_print(printf_buffer_t *buf, const hash_ranges_t &hr) {
+    debug_print(buf, hr.hash_ranges);
+}
+
+void debug_print(printf_buffer_t *buf, const active_ranges_t &ar) {
+    debug_print(buf, ar.ranges);
+}
+
+bool hash_range_with_cache_t::totally_exhausted() const {
+    return state == range_state_t::EXHAUSTED && cache.size() == 0;
+}
+
+range_state_t hash_ranges_t::state() const {
+    bool seen_saturated = false;
+    for (auto &&pair : hash_ranges) {
+        switch (pair.second.state) {
+        case range_state_t::ACTIVE: return range_state_t::ACTIVE;
+        case range_state_t::SATURATED:
+            seen_saturated = true;
+            break;
+        case range_state_t::EXHAUSTED: break;
+        default: unreachable();
+        }
+    }
+    return seen_saturated ? range_state_t::SATURATED : range_state_t::EXHAUSTED;
+}
+
+bool hash_ranges_t::totally_exhausted() const {
+    for (auto &&pair : hash_ranges) {
+        if (!pair.second.totally_exhausted()) return false;
     }
     return true;
+}
+
+bool active_ranges_t::totally_exhausted() const {
+    for (auto &&pair : ranges) {
+        if (!pair.second.totally_exhausted()) return false;
+    }
+    return true;
+}
+
+store_key_t truncate_and_get_left(active_ranges_t *ranges) {
+    const store_key_t *smallest_left = &store_key_max;
+    for (auto &&pair: ranges->ranges) {
+        for (auto &&hash_pair : pair.second.hash_ranges) {
+            if (hash_pair.second.cache.size() != 0) {
+                // If we truncate the cache for a shard, it's always active.
+                hash_pair.second.state = range_state_t::ACTIVE;
+                // This should only ever be called when iterating left to right.
+                hash_pair.second.key_range.left = hash_pair.second.cache[0].key;
+                hash_pair.second.cache.clear();
+            }
+            if (hash_pair.second.key_range.left < *smallest_left) {
+                smallest_left = &hash_pair.second.key_range.left;
+            }
+        }
+    }
+    return *smallest_left;
+}
+
+key_range_t active_ranges_to_range(const active_ranges_t &ranges) {
+    store_key_t start = store_key_t::max();
+    store_key_t end = store_key_t::min();
+    bool seen_active = false;
+    for (auto &&pair : ranges.ranges) {
+        switch (pair.second.state()) {
+        case range_state_t::ACTIVE:
+            for (auto &&hash_pair : pair.second.hash_ranges) {
+                start = std::min(start, hash_pair.second.key_range.left);
+                end = std::max(end, hash_pair.second.key_range.right.key_or_max());
+            }
+            seen_active = true;
+            break;
+        case range_state_t::SATURATED:
+            // If we didn't use any of the values we read last time, don't read
+            // any more this time.
+            break;
+        case range_state_t::EXHAUSTED:
+            // If there's no more data in a range then don't bother reading from it.
+            break;
+        default: unreachable();
+        }
+    }
+
+    // We shouldn't get here unless there's at least one active range.
+    r_sanity_check(seen_active);
+    return key_range_t(key_range_t::closed, start, key_range_t::open, end);
+}
+
+boost::optional<std::map<region_t, store_key_t> > active_ranges_to_hints(
+    sorting_t sorting, const boost::optional<active_ranges_t> &ranges) {
+
+    if (!ranges) return boost::none;
+
+    std::map<region_t, store_key_t> hints;
+    for (auto &&pair : ranges->ranges) {
+        switch (pair.second.state()) {
+        case range_state_t::ACTIVE:
+            for (auto &&hash_pair : pair.second.hash_ranges) {
+                // If any of the hash shards in a range are active, we send
+                // reads for all of them, because the assumption is that data is
+                // randomly distributed across hash shards, which means the only
+                // case where some are active and some are saturated is when
+                // we're reading really small batches for some reason
+                // (e.g. because of a sparse filter), in which case we still
+                // want to read from all the hash shards at once.
+                switch (hash_pair.second.state) {
+                case range_state_t::ACTIVE: // fallthru
+                case range_state_t::SATURATED:
+                    hints[region_t(hash_pair.first.beg,
+                                   hash_pair.first.end,
+                                   pair.first)] = !reversed(sorting)
+                        ? hash_pair.second.key_range.left
+                        : hash_pair.second.key_range.right.key_or_max();
+                    break;
+                case range_state_t::EXHAUSTED: break;
+                default: unreachable();
+                }
+            }
+            break;
+        case range_state_t::SATURATED: break;
+        case range_state_t::EXHAUSTED: break;
+        default: unreachable();
+        }
+    }
+    r_sanity_check(hints.size() > 0);
+    return std::move(hints);
+}
+
+enum class is_secondary_t { NO, YES };
+active_ranges_t new_active_ranges(
+    const stream_t &stream,
+    key_range_t &&original_range,
+    is_secondary_t is_secondary) {
+    active_ranges_t ret;
+    for (auto &&pair : stream.substreams) {
+        std::map<hash_range_t, hash_range_with_cache_t> hash_ranges;
+        ret.ranges[pair.first.inner]
+           .hash_ranges[hash_range_t{pair.first.beg, pair.first.end}]
+            = hash_range_with_cache_t{
+                is_secondary == is_secondary_t::YES
+                    ? std::move(original_range)
+                    : pair.first.inner.intersection(original_range),
+                raw_stream_t(),
+                range_state_t::ACTIVE};
+    }
+    return ret;
+}
+
+class pseudoshard_t {
+public:
+    pseudoshard_t(sorting_t _sorting,
+                  hash_range_with_cache_t *_cached,
+                  keyed_stream_t *_fresh)
+        : sorting(_sorting),
+          cached(_cached),
+          cached_index(0),
+          fresh(_fresh),
+          fresh_index(0),
+          finished(false) {
+        r_sanity_check(_cached != nullptr);
+    }
+    pseudoshard_t(pseudoshard_t &&) = default;
+    pseudoshard_t &operator=(pseudoshard_t &&) = default;
+
+    void finish() {
+        r_sanity_check(!finished);
+        switch (cached->state) {
+        case range_state_t::ACTIVE:
+            if (cached->cache.size() != 0) {
+                if (cached_index == 0) {
+                    cached->state = range_state_t::SATURATED;
+                }
+            } else if (fresh != nullptr && fresh->stream.size() != 0) {
+                if (fresh_index == 0) {
+                    cached->state = range_state_t::SATURATED;
+                }
+            } else {
+                // No fresh values and no cached values means we should be exhausted.
+                r_sanity_check(false);
+            }
+            break;
+        case range_state_t::SATURATED:
+            // A shard should never be saturated unless it has cached values.
+            r_sanity_check(cached->cache.size() != 0);
+            if (cached_index != 0) {
+                cached->state = range_state_t::ACTIVE;
+            }
+            break;
+        case range_state_t::EXHAUSTED: break;
+        default: unreachable();
+        }
+        if (fresh != nullptr || cached_index > 0) {
+            raw_stream_t new_cache;
+            new_cache.reserve((cached->cache.size() - cached_index)
+                              + (fresh ? (fresh->stream.size() - fresh_index) : 0));
+            std::move(cached->cache.begin() + cached_index,
+                      cached->cache.end(),
+                      std::back_inserter(new_cache));
+            if (fresh != nullptr) {
+                std::move(fresh->stream.begin() + fresh_index,
+                          fresh->stream.end(),
+                          std::back_inserter(new_cache));
+            }
+            cached->cache = std::move(new_cache);
+        }
+        finished = true;
+    }
+
+    const store_key_t *best_unpopped_key() const {
+        r_sanity_check(!finished);
+        if (cached_index < cached->cache.size()) {
+            return &cached->cache[cached_index].key;
+        } else if (fresh != nullptr && fresh_index < fresh->stream.size()) {
+            return &fresh->stream[fresh_index].key;
+        } else {
+            if (!reversed(sorting)) {
+                return cached->key_range.is_empty()
+                    ? &store_key_max
+                    : &cached->key_range.left;
+            } else {
+                return cached->key_range.is_empty()
+                    ? &store_key_min
+                    : &cached->key_range.right_or_max();
+            }
+        }
+    }
+
+    boost::optional<rget_item_t> pop() {
+        r_sanity_check(!finished);
+        if (cached_index < cached->cache.size()) {
+            return std::move(cached->cache[cached_index++]);
+        } else if (fresh != nullptr && fresh_index < fresh->stream.size()) {
+            return std::move(fresh->stream[fresh_index++]);
+        } else {
+            return boost::none;
+        }
+    }
+private:
+    // We move out of `cached` and `fresh`, so we need to act like we have ownership.
+    DISABLE_COPYING(pseudoshard_t);
+    sorting_t sorting;
+    hash_range_with_cache_t *cached;
+    size_t cached_index;
+    keyed_stream_t *fresh;
+    size_t fresh_index;
+    bool finished;
+};
+
+raw_stream_t rget_response_reader_t::unshard(
+    sorting_t sorting,
+    rget_read_response_t &&res) {
+
+    grouped_t<stream_t> *gs = boost::get<grouped_t<stream_t> >(&res.result);
+    r_sanity_check(gs != nullptr);
+    auto stream = groups_to_batch(gs->get_underlying_map());
+    if (!active_ranges) {
+        active_ranges = new_active_ranges(
+            stream, readgen->original_keyrange(res.reql_version),
+            readgen->sindex_name() ? is_secondary_t::YES : is_secondary_t::NO);
+        readgen->restrict_active_ranges(sorting, &*active_ranges);
+        reql_version = res.reql_version;
+    } else {
+        r_sanity_check(res.reql_version == reql_version);
+    }
+
+    raw_stream_t ret;
+    // Create the pseudoshards, which represent the cached, fresh, and
+    // hypothetical `rget_item_t`s from the shards.  We also mark shards
+    // exhausted in this step.
+    std::vector<pseudoshard_t> pseudoshards;
+    pseudoshards.reserve(active_ranges->ranges.size() * CPU_SHARDING_FACTOR);
+    size_t n_active = 0, n_fresh = 0;
+    for (auto &&pair : active_ranges->ranges) {
+        bool range_active = pair.second.state() == range_state_t::ACTIVE;
+        for (auto &&hash_pair : pair.second.hash_ranges) {
+            if (hash_pair.second.totally_exhausted()) continue;
+            keyed_stream_t *fresh = nullptr;
+            // Active shards need their bounds updated.
+            if (range_active) {
+                n_active += 1;
+                store_key_t *new_bound = nullptr;
+                auto it = stream.substreams.find(
+                    region_t(hash_pair.first.beg, hash_pair.first.end, pair.first));
+                if (it != stream.substreams.end()) {
+                    n_fresh += 1;
+                    fresh = &it->second;
+                    new_bound = &it->second.last_key;
+                }
+                if (!reversed(sorting)) {
+                    if (new_bound != nullptr && *new_bound != store_key_max) {
+                        hash_pair.second.key_range.left = *new_bound;
+                        bool incremented = hash_pair.second.key_range.left.increment();
+                        r_sanity_check(incremented); // not max key
+                    } else {
+                        hash_pair.second.key_range.left =
+                            hash_pair.second.key_range.right_or_max();
+                    }
+                } else {
+                    // The right bound is open so we don't need to decrement.
+                    if (new_bound != nullptr && *new_bound != store_key_min) {
+                        hash_pair.second.key_range.right =
+                            key_range_t::right_bound_t(*new_bound);
+                    } else {
+                        hash_pair.second.key_range.right =
+                            key_range_t::right_bound_t(hash_pair.second.key_range.left);
+                    }
+                }
+                if (new_bound) {
+                    // If there's nothing left to read, it's exhausted.
+                    if (hash_pair.second.key_range.is_empty()) {
+                        hash_pair.second.state = range_state_t::EXHAUSTED;
+                    }
+                } else {
+                    // If we got no data back, the logic above should have set
+                    // the range to something empty.
+                    r_sanity_check(hash_pair.second.key_range.is_empty());
+                    hash_pair.second.state = range_state_t::EXHAUSTED;
+                }
+            }
+            // If there's any data for a hash shard, we need to consider it
+            // while unsharding.  Note that the shard may have *already been
+            // marked exhausted* in the step above.
+            if (fresh != nullptr || hash_pair.second.cache.size() > 0) {
+                pseudoshards.emplace_back(sorting, &hash_pair.second, fresh);
+            }
+        }
+    }
+    if (pseudoshards.size() == 0) {
+        r_sanity_check(shards_exhausted());
+        return ret;
+    }
+
+    // Do the unsharding.
+    if (sorting != sorting_t::UNORDERED) {
+        for (;;) {
+            pseudoshard_t *best_shard = &pseudoshards[0];
+            const store_key_t *best_key = best_shard->best_unpopped_key();
+            for (size_t i = 1; i < pseudoshards.size(); ++i) {
+                pseudoshard_t *cur_shard = &pseudoshards[i];
+                const store_key_t *cur_key = cur_shard->best_unpopped_key();
+                if (is_better(*cur_key, *best_key, sorting)) {
+                    best_shard = cur_shard;
+                    best_key = cur_key;
+                }
+            }
+            if (auto maybe_item = best_shard->pop()) {
+                ret.push_back(*maybe_item);
+            } else {
+                break;
+            }
+        }
+    } else {
+        std::vector<size_t> active;
+        active.reserve(pseudoshards.size());
+        for (size_t i = 0; i < pseudoshards.size(); ++i) {
+            active.push_back(i);
+        }
+        while (active.size() > 0) {
+            // We try to interleave data from different shards so that batched
+            // updates distribute load over all servers.
+            for (size_t i = 0; i < active.size(); ++i) {
+                if (auto maybe_item = pseudoshards[active[i]].pop()) {
+                    ret.push_back(std::move(*maybe_item));
+                } else {
+                    std::swap(active[i], active[active.size() - 1]);
+                    active.pop_back();
+                }
+            }
+        }
+    }
+    // We should have aborted earlier if there was no data.  If this assert ever
+    // becomes false, make sure that we can't get into a state where all shards
+    // are marked saturated.
+    r_sanity_check(ret.size() != 0);
+
+    // Make sure `active_ranges` is in a clean state.
+    for (auto &&ps : pseudoshards) ps.finish();
+    bool seen_active = false;
+    bool seen_saturated = false;
+    for (auto &&pair : active_ranges->ranges) {
+        switch (pair.second.state()) {
+        case range_state_t::ACTIVE: seen_active = true; break;
+        case range_state_t::SATURATED: seen_saturated = true; break;
+        case range_state_t::EXHAUSTED: break;
+        default: unreachable();
+        }
+    }
+    if (!seen_active) {
+        // We should always have marked a saturated shard as active if the last
+        // active shard was exhausted.
+        r_sanity_check(!seen_saturated);
+        r_sanity_check(shards_exhausted());
+    }
+
+    return ret;
 }
 
 // RANGE/READGEN STUFF
 rget_response_reader_t::rget_response_reader_t(
     const counted_t<real_table_t> &_table,
-    bool _use_outdated,
     scoped_ptr_t<readgen_t> &&_readgen)
     : table(_table),
-      use_outdated(_use_outdated),
-      started(false), shards_exhausted(false),
+      started(false),
       readgen(std::move(_readgen)),
       last_read_start(store_key_t::min()),
-      active_range(readgen->original_keyrange()),
       items_index(0) { }
 
 void rget_response_reader_t::add_transformation(transform_variant_t &&tv) {
@@ -45,28 +472,30 @@ bool rget_response_reader_t::add_stamp(changefeed_stamp_t _stamp) {
     return true;
 }
 
-boost::optional<active_state_t> rget_response_reader_t::get_active_state() const {
-    if (!stamp || !active_range || shard_stamps.size() == 0) return boost::none;
+boost::optional<active_state_t> rget_response_reader_t::truncate_and_get_active_state() {
+    if (!stamp || !active_ranges || shard_stamps.size() == 0) return boost::none;
     return active_state_t{
         key_range_t(key_range_t::closed, last_read_start,
-                    key_range_t::open, active_range->left),
+                    key_range_t::open, truncate_and_get_left(&*active_ranges)),
         shard_stamps,
-        skey_version,
+        reql_version,
         DEBUG_ONLY(readgen->sindex_name())};
 }
 
-void rget_response_reader_t::accumulate(env_t *env, eager_acc_t *acc,
+void rget_response_reader_t::accumulate(env_t *env,
+                                        eager_acc_t *acc,
                                         const terminal_variant_t &tv) {
     r_sanity_check(!started);
-    started = shards_exhausted = true;
+    started = true;
     batchspec_t batchspec = batchspec_t::user(batch_type_t::TERMINAL, env);
     read_t read = readgen->terminal_read(transforms, tv, batchspec);
     result_t res = do_read(env, std::move(read)).result;
-    acc->add_res(env, &res);
+    mark_shards_exhausted();
+    acc->add_res(env, &res, readgen->sorting(batchspec));
 }
 
-std::vector<datum_t> rget_response_reader_t::next_batch(env_t *env,
-                                                        const batchspec_t &batchspec) {
+std::vector<datum_t> rget_response_reader_t::next_batch(
+    env_t *env, const batchspec_t &batchspec) {
     started = true;
     if (!load_items(env, batchspec)) {
         return std::vector<datum_t>();
@@ -106,7 +535,7 @@ std::vector<datum_t> rget_response_reader_t::next_batch(env_t *env,
                 res.push_back(std::move(items[items_index].data));
 
                 rcheck_datum(
-                    res.size() <= env->limits().array_size_limit(), base_exc_t::GENERIC,
+                    res.size() <= env->limits().array_size_limit(), base_exc_t::RESOURCE,
                     strprintf("Too many rows (> %zu) with the same value "
                               "for index `%s`:\n%s",
                               env->limits().array_size_limit(),
@@ -135,12 +564,15 @@ std::vector<datum_t> rget_response_reader_t::next_batch(env_t *env,
         tmp.swap(items);
     }
 
-    shards_exhausted = (res.size() == 0) ? true : shards_exhausted;
+    if (res.size() == 0) {
+        r_sanity_check(shards_exhausted());
+    }
+
     return res;
 }
 
 bool rget_response_reader_t::is_finished() const {
-    return shards_exhausted && items_index >= items.size();
+    return shards_exhausted() && items_index >= items.size();
 }
 
 struct last_read_start_visitor_t : public boost::static_visitor<store_key_t> {
@@ -164,7 +596,7 @@ struct last_read_start_visitor_t : public boost::static_visitor<store_key_t> {
 
 rget_read_response_t rget_response_reader_t::do_read(env_t *env, const read_t &read) {
     read_response_t res;
-    table->read_with_profile(env, read, &res, use_outdated);
+    table->read_with_profile(env, read, &res);
     auto rget_res = boost::get<rget_read_response_t>(&res.response);
     r_sanity_check(rget_res != NULL);
     if (auto e = boost::get<exc_t>(&rget_res->result)) {
@@ -176,24 +608,30 @@ rget_read_response_t rget_response_reader_t::do_read(env_t *env, const read_t &r
 
 rget_reader_t::rget_reader_t(
     const counted_t<real_table_t> &_table,
-    bool _use_outdated,
     scoped_ptr_t<readgen_t> &&_readgen)
-    : rget_response_reader_t(_table, _use_outdated, std::move(_readgen)) { }
+    : rget_response_reader_t(_table, std::move(_readgen)) { }
 
 void rget_reader_t::accumulate_all(env_t *env, eager_acc_t *acc) {
     r_sanity_check(!started);
     started = true;
     batchspec_t batchspec = batchspec_t::all();
-    read_t read = readgen->next_read(active_range, stamp, transforms, batchspec);
+    read_t read = readgen->next_read(
+        active_ranges, reql_version, stamp, transforms, batchspec);
     rget_read_response_t resp = do_read(env, std::move(read));
 
     auto *rr = boost::get<rget_read_t>(&read.read);
+    r_sanity_check(rr != nullptr);
     auto final_key = !reversed(rr->sorting) ? store_key_t::max() : store_key_t::min();
-    r_sanity_check(resp.last_key == final_key);
-    r_sanity_check(!resp.truncated);
-    shards_exhausted = true;
+    auto *stream = boost::get<grouped_t<stream_t> >(&resp.result);
+    r_sanity_check(stream != nullptr);
+    for (auto &&pair : *stream) {
+        for (auto &&stream_pair : pair.second.substreams) {
+            r_sanity_check(stream_pair.second.last_key == final_key);
+        }
+    }
+    mark_shards_exhausted();
 
-    acc->add_res(env, &resp.result);
+    acc->add_res(env, &resp.result, readgen->sorting(batchspec));
 }
 
 std::vector<rget_item_t>
@@ -202,125 +640,74 @@ rget_reader_t::do_range_read(env_t *env, const read_t &read) {
     r_sanity_check(rr);
     rget_read_response_t res = do_read(env, read);
 
-    key_range_t rng;
-    if (rr->sindex) {
-        if (skey_version) {
-            r_sanity_check(res.skey_version == *skey_version);
-        } else {
-            skey_version = res.skey_version;
-        }
-        if (!active_range) {
-            r_sanity_check(!rr->sindex->region);
-            active_range = rng = readgen->sindex_keyrange(res.skey_version);
-        } else {
-            r_sanity_check(rr->sindex->region);
-            rng = (*rr->sindex->region).inner;
-        }
-    } else {
-        rng = rr->region.inner;
-    }
-
     r_sanity_check(static_cast<bool>(stamp) == static_cast<bool>(rr->stamp));
     if (stamp) {
         r_sanity_check(res.stamp_response);
-        for (const auto &pair : (*res.stamp_response).stamps) {
+        rcheck_datum(res.stamp_response->stamps, base_exc_t::RESUMABLE_OP_FAILED,
+                     "Unable to retrieve start stamps.  (Did you just reshard?)");
+        rcheck_datum(res.stamp_response->stamps->size() != 0,
+                     base_exc_t::RESUMABLE_OP_FAILED,
+                     "Empty start stamps.  Did you just reshard?");
+        for (const auto &pair : *res.stamp_response->stamps) {
             // It's OK to blow away old values.
             shard_stamps[pair.first] = pair.second;
         }
     }
 
-    // We need to do some adjustments to the last considered key so that we
-    // update the range correctly in the case where we're reading a subportion
-    // of the total range.
-    store_key_t *key = &res.last_key;
-    if (*key == store_key_t::max() && !reversed(rr->sorting)) {
-        if (!rng.right.unbounded) {
-            *key = rng.right.key;
-            bool b = key->decrement();
-            r_sanity_check(b);
-        }
-    } else if (*key == store_key_t::min() && reversed(rr->sorting)) {
-        *key = rng.left;
-    }
-
-    r_sanity_check(active_range);
-    shards_exhausted = readgen->update_range(&*active_range, res.last_key);
-    grouped_t<stream_t> *gs = boost::get<grouped_t<stream_t> >(&res.result);
-
-    // groups_to_batch asserts that underlying_map has 0 or 1 elements, so it is
-    // correct to declare that the order doesn't matter.
-    return groups_to_batch(gs->get_underlying_map());
+    return unshard(rr->sorting, std::move(res));
 }
 
 bool rget_reader_t::load_items(env_t *env, const batchspec_t &batchspec) {
     started = true;
-    if (items_index >= items.size() && !shards_exhausted) { // read some more
+    while (items_index >= items.size() && !shards_exhausted()) {
         items_index = 0;
         // `active_range` is guaranteed to be full after the `do_range_read`,
         // because `do_range_read` is responsible for updating the active range.
         items = do_range_read(
-            env, readgen->next_read(active_range, stamp, transforms, batchspec));
-        // Everything below this point can handle `items` being empty (this is
-        // good hygiene anyway).
-        r_sanity_check(active_range);
-        while (boost::optional<read_t> read = readgen->sindex_sort_read(
-                   *active_range, items, stamp, transforms, batchspec)) {
-            std::vector<rget_item_t> new_items = do_range_read(env, *read);
-            if (new_items.size() == 0) {
-                break;
-            }
-
-            rcheck_datum(
-                (items.size() + new_items.size()) <= env->limits().array_size_limit(),
-                base_exc_t::GENERIC,
-                strprintf("Too many rows (> %zu) with the same "
-                          "truncated key for index `%s`.  "
-                          "Example value:\n%s\n"
-                          "Truncated key:\n%s",
-                          env->limits().array_size_limit(),
-                          opt_or(readgen->sindex_name(), "").c_str(),
-                          items[items.size() - 1].sindex_key.trunc_print().c_str(),
-                          key_to_debug_str(items[items.size() - 1].key).c_str()));
-
-            items.reserve(items.size() + new_items.size());
-            std::move(new_items.begin(), new_items.end(), std::back_inserter(items));
-        }
-        readgen->sindex_sort(&items);
-    }
-    if (items_index >= items.size()) {
-        shards_exhausted = true;
+            env,
+            readgen->next_read(
+                active_ranges, reql_version, stamp, transforms, batchspec));
+        r_sanity_check(active_ranges);
+        readgen->sindex_sort(&items, batchspec);
     }
     return items_index < items.size();
 }
 
 intersecting_reader_t::intersecting_reader_t(
     const counted_t<real_table_t> &_table,
-    bool _use_outdated,
     scoped_ptr_t<readgen_t> &&_readgen)
-    : rget_response_reader_t(_table, _use_outdated, std::move(_readgen)) { }
+    : rget_response_reader_t(_table, std::move(_readgen)) { }
 
 void intersecting_reader_t::accumulate_all(env_t *env, eager_acc_t *acc) {
     r_sanity_check(!started);
     started = true;
     batchspec_t batchspec = batchspec_t::all();
-    read_t read = readgen->next_read(active_range, stamp, transforms, batchspec);
+    read_t read = readgen->next_read(
+        active_ranges, reql_version, stamp, transforms, batchspec);
     rget_read_response_t resp = do_read(env, std::move(read));
 
     auto final_key = store_key_t::max();
-    r_sanity_check(resp.last_key == final_key);
-    r_sanity_check(!resp.truncated);
-    shards_exhausted = true;
+    auto *stream = boost::get<grouped_t<stream_t> >(&resp.result);
+    r_sanity_check(stream != nullptr);
+    for (auto &&pair : *stream) {
+        for (auto &&stream_pair : pair.second.substreams) {
+            r_sanity_check(stream_pair.second.last_key == final_key);
+        }
+    }
+    mark_shards_exhausted();
 
-    acc->add_res(env, &resp.result);
+    acc->add_res(env, &resp.result, sorting_t::UNORDERED);
 }
 
 bool intersecting_reader_t::load_items(env_t *env, const batchspec_t &batchspec) {
     started = true;
-    while (items_index >= items.size() && !shards_exhausted) { // read some more
+    while (items_index >= items.size() && !shards_exhausted()) { // read some more
         std::vector<rget_item_t> unfiltered_items = do_intersecting_read(
-            env, readgen->next_read(active_range, stamp, transforms, batchspec));
+            env,
+            readgen->next_read(
+                active_ranges, reql_version, stamp, transforms, batchspec));
         if (unfiltered_items.empty()) {
-            shards_exhausted = true;
+            r_sanity_check(shards_exhausted());
         } else {
             items_index = 0;
             items.clear();
@@ -331,7 +718,7 @@ bool intersecting_reader_t::load_items(env_t *env, const batchspec_t &batchspec)
                 if (processed_pkeys.count(pkey) == 0) {
                     rcheck_toplevel(
                         processed_pkeys.size() < env->limits().array_size_limit(),
-                        ql::base_exc_t::GENERIC,
+                        ql::base_exc_t::RESOURCE,
                         "Array size limit exceeded during geospatial index traversal.");
                     processed_pkeys.insert(pkey);
                     items.push_back(std::move(unfiltered_items[i]));
@@ -343,92 +730,59 @@ bool intersecting_reader_t::load_items(env_t *env, const batchspec_t &batchspec)
 }
 
 std::vector<rget_item_t> intersecting_reader_t::do_intersecting_read(
-        env_t *env, const read_t &read) {
+    env_t *env, const read_t &read) {
     rget_read_response_t res = do_read(env, read);
 
-    auto gr = boost::get<intersecting_geo_read_t>(&read.read);
+    auto *gr = boost::get<intersecting_geo_read_t>(&read.read);
     r_sanity_check(gr);
-
-    r_sanity_check(active_range);
     r_sanity_check(gr->sindex.region);
-    const key_range_t &rng = (*gr->sindex.region).inner;
 
-    // We need to do some adjustments to the last considered key so that we
-    // update the range correctly in the case where we're reading a subportion
-    // of the total range.
-    store_key_t *key = &res.last_key;
-    if (*key == store_key_t::max()) {
-        if (!rng.right.unbounded) {
-            *key = rng.right.key;
-            bool b = key->decrement();
-            r_sanity_check(b);
-        }
-    }
-
-    shards_exhausted = readgen->update_range(&*active_range, res.last_key);
-    grouped_t<stream_t> *gs = boost::get<grouped_t<stream_t> >(&res.result);
-
-    // groups_to_batch asserts that underlying_map has 0 or 1 elements, so it is
-    // correct to declare that the order doesn't matter.
-    return groups_to_batch(gs->get_underlying_map());
+    return unshard(sorting_t::UNORDERED, std::move(res));
 }
 
 readgen_t::readgen_t(
-    const std::map<std::string, wire_func_t> &_global_optargs,
+    global_optargs_t _global_optargs,
     std::string _table_name,
     profile_bool_t _profile,
+    read_mode_t _read_mode,
     sorting_t _sorting)
-    : global_optargs(_global_optargs),
+    : global_optargs(std::move(_global_optargs)),
       table_name(std::move(_table_name)),
       profile(_profile),
-      sorting(_sorting) { }
-
-bool readgen_t::update_range(key_range_t *active_range,
-                             const store_key_t &last_key) const {
-    if (!reversed(sorting)) {
-        active_range->left = last_key;
-    } else {
-        active_range->right = key_range_t::right_bound_t(last_key);
-    }
-
-    // TODO: mixing these non-const operations INTO THE CONDITIONAL is bad, and
-    // confused me (mlucy) for a while when I tried moving some stuff around.
-    if (!reversed(sorting)) {
-        if (!active_range->left.increment()
-            || (!active_range->right.unbounded
-                && (active_range->right.key < active_range->left))) {
-            return true;
-        }
-    } else {
-        r_sanity_check(!active_range->right.unbounded);
-        if (!active_range->right.key.decrement()
-            || active_range->right.key < active_range->left) {
-            return true;
-        }
-    }
-    return active_range->is_empty();
-}
+      read_mode(_read_mode),
+      sorting_(_sorting) { }
 
 rget_readgen_t::rget_readgen_t(
-    const std::map<std::string, wire_func_t> &_global_optargs,
+    global_optargs_t _global_optargs,
     std::string _table_name,
-    const datum_range_t &_original_datum_range,
+    const datumspec_t &_datumspec,
     profile_bool_t _profile,
+    read_mode_t _read_mode,
     sorting_t _sorting)
-    : readgen_t(_global_optargs, std::move(_table_name), _profile, _sorting),
-      original_datum_range(_original_datum_range) { }
+    : readgen_t(std::move(_global_optargs),
+                std::move(_table_name),
+                _profile, _read_mode, _sorting),
+      datumspec(_datumspec) { }
 
 read_t rget_readgen_t::next_read(
-    const boost::optional<key_range_t> &active_range,
+    const boost::optional<active_ranges_t> &active_ranges,
+    const boost::optional<reql_version_t> &reql_version,
     boost::optional<changefeed_stamp_t> stamp,
     std::vector<transform_variant_t> transforms,
     const batchspec_t &batchspec) const {
-    return read_t(next_read_impl(
-                      active_range,
-                      std::move(stamp),
-                      std::move(transforms),
-                      batchspec),
-                  profile);
+    return read_t(
+        next_read_impl(
+            active_ranges,
+            reql_version,
+            std::move(stamp),
+            std::move(transforms),
+            batchspec),
+        profile,
+        stamp ? up_to_date_read_mode(read_mode) : read_mode);
+}
+
+sorting_t readgen_t::sorting(const batchspec_t &batchspec) const {
+    return batchspec.lazy_sorting(sorting_);
 }
 
 // TODO: this is how we did it before, but it sucks.
@@ -437,151 +791,225 @@ read_t rget_readgen_t::terminal_read(
     const terminal_variant_t &_terminal,
     const batchspec_t &batchspec) const {
     rget_read_t read = next_read_impl(
-        original_keyrange(),
+        boost::none, // No active ranges, just use the original range.
+        boost::none, // No reql version yet.
         boost::optional<changefeed_stamp_t>(), // No need to stamp terminals.
         transforms,
         batchspec);
     read.terminal = _terminal;
-    return read_t(read, profile);
+    return read_t(read, profile, read_mode);
 }
 
 primary_readgen_t::primary_readgen_t(
-    const std::map<std::string, wire_func_t> &global_optargs,
+    global_optargs_t global_optargs,
     std::string table_name,
-    datum_range_t range,
-    profile_bool_t profile,
+    const datumspec_t &datumspec,
+    profile_bool_t _profile,
+    read_mode_t _read_mode,
     sorting_t sorting)
-    : rget_readgen_t(global_optargs, std::move(table_name), range, profile, sorting) { }
+    : rget_readgen_t(
+        std::move(global_optargs),
+        std::move(table_name),
+        datumspec,
+        _profile,
+        _read_mode,
+        sorting) {
+    store_keys = datumspec.primary_key_map();
+}
+
+// If we're doing a primary key `get_all`, then we want to restrict the active
+// ranges when we first calculate them so that we never try to read past the end
+// of the set of store keys.  (This prevents extra reads from being issued and
+// preserves the invariant that we always issue a read to a shard if it's in the
+// active ranges, which is how we detect resharding right now.)
+void primary_readgen_t::restrict_active_ranges(
+    sorting_t sorting,
+    active_ranges_t *ranges_inout) const {
+    if (store_keys && ranges_inout->ranges.size() != 0) {
+        std::map<key_range_t,
+                 std::map<hash_range_t,
+                          std::pair<store_key_t, store_key_t> > > limits;
+        for (auto &&pair : ranges_inout->ranges) {
+            for (auto &&hash_pair : pair.second.hash_ranges) {
+                limits[pair.first][hash_pair.first] =
+                    std::make_pair(store_key_t::max(), store_key_t::min());
+            }
+        }
+        for (const auto &key_pair : *store_keys) {
+            const store_key_t &key = key_pair.first;
+            uint64_t hash = hash_region_hasher(key);
+            for (auto &&pair : limits) {
+                if (pair.first.contains_key(key)) {
+                    for (auto &&hash_pair : pair.second) {
+                        if (hash_pair.first.contains(hash)) {
+                            hash_pair.second.first =
+                                std::min(hash_pair.second.first, key);
+                            hash_pair.second.second =
+                                std::max(hash_pair.second.second, key);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        for (auto &&pair : ranges_inout->ranges) {
+            for (auto &&hash_pair : pair.second.hash_ranges) {
+                const auto &keypair = limits[pair.first][hash_pair.first];
+                store_key_t new_start =
+                    std::max(keypair.first, hash_pair.second.key_range.left);
+                store_key_t new_end = keypair.second;
+                new_end.increment();
+                new_end = std::min(new_end, hash_pair.second.key_range.right_or_max());
+
+                if (new_start > new_end) {
+                    if (!reversed(sorting)) {
+                        hash_pair.second.key_range.left
+                            = hash_pair.second.key_range.right_or_max();
+                    } else {
+                        hash_pair.second.key_range.right.internal_key
+                            = hash_pair.second.key_range.left;
+                    }
+                    guarantee(hash_pair.second.key_range.is_empty());
+                } else {
+                    hash_pair.second.key_range.left = new_start;
+                    hash_pair.second.key_range.right.internal_key = new_end;
+                    guarantee(!hash_pair.second.key_range.is_empty()
+                              || new_start == new_end);
+                }
+                if (hash_pair.second.key_range.is_empty()) {
+                    hash_pair.second.state = range_state_t::EXHAUSTED;
+                }
+            }
+        }
+    }
+}
 
 scoped_ptr_t<readgen_t> primary_readgen_t::make(
     env_t *env,
     std::string table_name,
-    datum_range_t range,
+    read_mode_t read_mode,
+    const datumspec_t &datumspec,
     sorting_t sorting) {
     return scoped_ptr_t<readgen_t>(
         new primary_readgen_t(
             env->get_all_optargs(),
             std::move(table_name),
-            range,
+            datumspec,
             env->profile(),
+            read_mode,
             sorting));
 }
 
 rget_read_t primary_readgen_t::next_read_impl(
-    const boost::optional<key_range_t> &active_range,
+    const boost::optional<active_ranges_t> &active_ranges,
+    const boost::optional<reql_version_t> &,
     boost::optional<changefeed_stamp_t> stamp,
     std::vector<transform_variant_t> transforms,
     const batchspec_t &batchspec) const {
-    r_sanity_check(active_range);
+    region_t region = active_ranges
+        ? region_t(active_ranges_to_range(*active_ranges))
+        : region_t(datumspec.covering_range().to_primary_keyrange());
+    r_sanity_check(!region.inner.is_empty());
     return rget_read_t(
         std::move(stamp),
-        region_t(*active_range),
+        std::move(region),
+        active_ranges_to_hints(sorting(batchspec), active_ranges),
+        store_keys,
         global_optargs,
         table_name,
         batchspec,
         std::move(transforms),
         boost::optional<terminal_variant_t>(),
         boost::optional<sindex_rangespec_t>(),
-        sorting);
+        sorting(batchspec));
 }
 
-// We never need to do an sindex sort when indexing by a primary key.
-boost::optional<read_t> primary_readgen_t::sindex_sort_read(
-    UNUSED const key_range_t &active_range,
-    UNUSED const std::vector<rget_item_t> &items,
-    UNUSED boost::optional<changefeed_stamp_t> stamp,
-    UNUSED std::vector<transform_variant_t> transforms,
-    UNUSED const batchspec_t &batchspec) const {
-    return boost::optional<read_t>();
-}
-void primary_readgen_t::sindex_sort(UNUSED std::vector<rget_item_t> *vec) const {
+void primary_readgen_t::sindex_sort(
+    std::vector<rget_item_t> *, const batchspec_t &) const {
     return;
 }
 
-boost::optional<key_range_t> primary_readgen_t::original_keyrange() const {
-    return original_datum_range.to_primary_keyrange();
-}
-
-key_range_t primary_readgen_t::sindex_keyrange(skey_version_t) const {
-    crash("Cannot call `sindex_keyrange` on a primary readgen (internal server error).");
+key_range_t primary_readgen_t::original_keyrange(reql_version_t) const {
+    return datumspec.covering_range().to_primary_keyrange();
 }
 
 boost::optional<std::string> primary_readgen_t::sindex_name() const {
     return boost::optional<std::string>();
 }
 
+changefeed::keyspec_t::range_t primary_readgen_t::get_range_spec(
+        std::vector<transform_variant_t> transforms) const {
+    return changefeed::keyspec_t::range_t{
+        std::move(transforms),
+        sindex_name(),
+        sorting_,
+        datumspec};
+}
+
 sindex_readgen_t::sindex_readgen_t(
-    const std::map<std::string, wire_func_t> &global_optargs,
+    global_optargs_t global_optargs,
     std::string table_name,
     const std::string &_sindex,
-    datum_range_t range,
-    profile_bool_t profile,
+    const datumspec_t &datumspec,
+    profile_bool_t _profile,
+    read_mode_t _read_mode,
     sorting_t sorting)
-    : rget_readgen_t(global_optargs, std::move(table_name), range, profile, sorting),
+    : rget_readgen_t(
+        std::move(global_optargs),
+        std::move(table_name),
+        datumspec,
+        _profile,
+        _read_mode,
+        sorting),
       sindex(_sindex),
       sent_first_read(false) { }
 
 scoped_ptr_t<readgen_t> sindex_readgen_t::make(
     env_t *env,
     std::string table_name,
+    read_mode_t read_mode,
     const std::string &sindex,
-    datum_range_t range,
+    const datumspec_t &datumspec,
     sorting_t sorting) {
     return scoped_ptr_t<readgen_t>(
         new sindex_readgen_t(
             env->get_all_optargs(),
             std::move(table_name),
             sindex,
-            range,
+            datumspec,
             env->profile(),
+            read_mode,
             sorting));
 }
 
-class sindex_compare_t {
-public:
-    explicit sindex_compare_t(sorting_t _sorting)
-        : sorting(_sorting) { }
-    bool operator()(const rget_item_t &l, const rget_item_t &r) {
-        r_sanity_check(l.sindex_key.has() && r.sindex_key.has());
-
-        // We don't have to worry about v1.13.x because there's no way this is
-        // running inside of a secondary index function.  Also, in case you're
-        // wondering, it's okay for this ordering to be different from the buggy
-        // secondary index key ordering that existed in v1.13.  It was different in
-        // v1.13 itself.  For that, we use the last_key value in the
-        // rget_read_response_t.
-        if (l.sindex_key == r.sindex_key) {
-            return reversed(sorting)
-                ? datum_t::extract_primary(l.key) > datum_t::extract_primary(r.key)
-                : datum_t::extract_primary(l.key) < datum_t::extract_primary(r.key);
-        } else {
-            return reversed(sorting)
-                ? l.sindex_key > r.sindex_key
-                : l.sindex_key < r.sindex_key;
-        }
-    }
-private:
-    sorting_t sorting;
-};
-
-void sindex_readgen_t::sindex_sort(std::vector<rget_item_t> *vec) const {
+void sindex_readgen_t::sindex_sort(
+    std::vector<rget_item_t> *vec,
+    const batchspec_t &batchspec) const {
     if (vec->size() == 0) {
         return;
     }
-    if (sorting != sorting_t::UNORDERED) {
-        std::stable_sort(vec->begin(), vec->end(), sindex_compare_t(sorting));
+    if (sorting(batchspec) != sorting_t::UNORDERED) {
+        std::stable_sort(vec->begin(), vec->end(),
+                         sindex_compare_t(sorting(batchspec)));
     }
 }
 
 rget_read_t sindex_readgen_t::next_read_impl(
-    const boost::optional<key_range_t> &active_range,
+    const boost::optional<active_ranges_t> &active_ranges,
+    const boost::optional<reql_version_t> &reql_version,
     boost::optional<changefeed_stamp_t> stamp,
     std::vector<transform_variant_t> transforms,
     const batchspec_t &batchspec) const {
+
     boost::optional<region_t> region;
-    if (active_range) {
-        region = region_t(*active_range);
+    datumspec_t ds;
+    if (active_ranges) {
+        region = region_t(active_ranges_to_range(*active_ranges));
+        r_sanity_check(reql_version);
+        ds = datumspec.trim_secondary(region->inner, *reql_version);
     } else {
+        ds = datumspec;
         // We should send at most one read before we're able to calculate the
         // active range.
         r_sanity_check(!sent_first_read);
@@ -590,97 +1018,53 @@ rget_read_t sindex_readgen_t::next_read_impl(
         // away once we drop support for pre-1.16 sindex key skey_version.
         const_cast<sindex_readgen_t *>(this)->sent_first_read = true;
     }
+    r_sanity_check(!ds.is_empty());
+
     return rget_read_t(
         std::move(stamp),
         region_t::universe(),
+        active_ranges_to_hints(sorting(batchspec), active_ranges),
+        boost::none,
         global_optargs,
         table_name,
         batchspec,
         std::move(transforms),
         boost::optional<terminal_variant_t>(),
-        sindex_rangespec_t(sindex, std::move(region), original_datum_range),
-        sorting);
+        sindex_rangespec_t(sindex, std::move(region), std::move(ds)),
+        sorting(batchspec));
 }
 
-boost::optional<read_t> sindex_readgen_t::sindex_sort_read(
-    const key_range_t &active_range,
-    const std::vector<rget_item_t> &items,
-    boost::optional<changefeed_stamp_t> stamp,
-    std::vector<transform_variant_t> transforms,
-    const batchspec_t &batchspec) const {
-
-    if (sorting != sorting_t::UNORDERED && items.size() > 0) {
-        const store_key_t &key = items[items.size() - 1].key;
-        if (datum_t::key_is_truncated(key)) {
-            // We need to truncate the skey down to the smallest *guaranteed*
-            // length of secondary index keys in the btree.
-            // This is important because the prefix of a truncated sindex key
-            // that's actually getting stored can vary for different documents
-            // even with the same key, if their primary key is of different lengths.
-            // If we didn't do that, the search range which we construct in the
-            // next step might miss some relevant keys that have been truncated
-            // differently. (the lack of this was the cause of
-            // https://github.com/rethinkdb/rethinkdb/issues/3444)
-            std::string skey =
-                datum_t::extract_truncated_secondary(key_to_unescaped_str(key));
-            key_range_t rng = active_range;
-            if (!reversed(sorting)) {
-                // We construct a right bound that's larger than the maximum
-                // possible row with this truncated sindex.
-                rng.right = key_range_t::right_bound_t(
-                    store_key_t(skey + std::string(MAX_KEY_SIZE - skey.size(), 0xFF)));
-            } else {
-                // We construct a left bound that's smaller than the minimum
-                // possible row with this truncated sindex.
-                rng.left = store_key_t(skey);
-            }
-            if (rng.right.unbounded || rng.left < rng.right.key) {
-                return read_t(
-                    rget_read_t(
-                        std::move(stamp),
-                        region_t::universe(),
-                        global_optargs,
-                        table_name,
-                        batchspec.with_new_batch_type(batch_type_t::SINDEX_CONSTANT),
-                        std::move(transforms),
-                        boost::optional<terminal_variant_t>(),
-                        sindex_rangespec_t(
-                            sindex,
-                            region_t(key_range_t(rng)),
-                            original_datum_range),
-                        sorting),
-                    profile);
-            }
-        }
-    }
-    return boost::optional<read_t>();
-}
-
-boost::optional<key_range_t> sindex_readgen_t::original_keyrange() const {
-    return boost::none;
-}
-
-key_range_t sindex_readgen_t::sindex_keyrange(skey_version_t skey_version) const {
-    return original_datum_range.to_sindex_keyrange(skey_version);
+key_range_t sindex_readgen_t::original_keyrange(reql_version_t rv) const {
+    return datumspec.covering_range().to_sindex_keyrange(rv);
 }
 
 boost::optional<std::string> sindex_readgen_t::sindex_name() const {
     return sindex;
 }
 
+changefeed::keyspec_t::range_t sindex_readgen_t::get_range_spec(
+        std::vector<transform_variant_t> transforms) const {
+    return changefeed::keyspec_t::range_t{
+        std::move(transforms), sindex_name(), sorting_, datumspec};
+}
+
 intersecting_readgen_t::intersecting_readgen_t(
-    const std::map<std::string, wire_func_t> &global_optargs,
+    global_optargs_t global_optargs,
     std::string table_name,
     const std::string &_sindex,
     const datum_t &_query_geometry,
-    profile_bool_t profile)
-    : readgen_t(global_optargs, std::move(table_name), profile, sorting_t::UNORDERED),
+    profile_bool_t _profile,
+    read_mode_t _read_mode)
+    : readgen_t(std::move(global_optargs),
+                std::move(table_name),
+                _profile, _read_mode, sorting_t::UNORDERED),
       sindex(_sindex),
       query_geometry(_query_geometry) { }
 
 scoped_ptr_t<readgen_t> intersecting_readgen_t::make(
     env_t *env,
     std::string table_name,
+    read_mode_t read_mode,
     const std::string &sindex,
     const datum_t &query_geometry) {
     return scoped_ptr_t<readgen_t>(
@@ -689,20 +1073,25 @@ scoped_ptr_t<readgen_t> intersecting_readgen_t::make(
             std::move(table_name),
             sindex,
             query_geometry,
-            env->profile()));
+            env->profile(),
+            read_mode));
 }
 
 read_t intersecting_readgen_t::next_read(
-    const boost::optional<key_range_t> &active_range,
+    const boost::optional<active_ranges_t> &active_ranges,
+    const boost::optional<reql_version_t> &reql_version,
     boost::optional<changefeed_stamp_t> stamp,
     std::vector<transform_variant_t> transforms,
     const batchspec_t &batchspec) const {
-    return read_t(next_read_impl(
-                      active_range,
-                      std::move(stamp),
-                      std::move(transforms),
-                      batchspec),
-                  profile);
+    return read_t(
+        next_read_impl(
+            active_ranges,
+            reql_version,
+            std::move(stamp),
+            std::move(transforms),
+            batchspec),
+        profile,
+        read_mode);
 }
 
 read_t intersecting_readgen_t::terminal_read(
@@ -711,20 +1100,24 @@ read_t intersecting_readgen_t::terminal_read(
     const batchspec_t &batchspec) const {
     intersecting_geo_read_t read =
         next_read_impl(
-            original_keyrange(),
+            boost::none,
+            boost::none,
             boost::optional<changefeed_stamp_t>(), // No need to stamp terminals.
             transforms,
             batchspec);
     read.terminal = _terminal;
-    return read_t(read, profile);
+    return read_t(read, profile, read_mode);
 }
 
 intersecting_geo_read_t intersecting_readgen_t::next_read_impl(
-    const boost::optional<key_range_t> &active_range,
+    const boost::optional<active_ranges_t> &active_ranges,
+    const boost::optional<reql_version_t> &,
     boost::optional<changefeed_stamp_t> stamp,
     std::vector<transform_variant_t> transforms,
     const batchspec_t &batchspec) const {
-    r_sanity_check(active_range);
+    region_t region = active_ranges
+        ? region_t(active_ranges_to_range(*active_ranges))
+        : region_t(safe_universe());
     return intersecting_geo_read_t(
         std::move(stamp),
         region_t::universe(),
@@ -733,39 +1126,24 @@ intersecting_geo_read_t intersecting_readgen_t::next_read_impl(
         batchspec,
         std::move(transforms),
         boost::optional<terminal_variant_t>(),
-        sindex_rangespec_t(sindex, region_t(*active_range), datum_range_t::universe()),
+        sindex_rangespec_t(
+            sindex,
+            std::move(region),
+            datumspec_t(datum_range_t::universe())),
         query_geometry);
 }
 
-boost::optional<read_t> intersecting_readgen_t::sindex_sort_read(
-    UNUSED const key_range_t &active_range,
-    UNUSED const std::vector<rget_item_t> &items,
-    UNUSED boost::optional<changefeed_stamp_t> stamp,
-    UNUSED std::vector<transform_variant_t> transform,
-    UNUSED const batchspec_t &batchspec) const {
-    // Intersection queries don't support sorting
-    return boost::optional<read_t>();
-}
-
-void intersecting_readgen_t::sindex_sort(UNUSED std::vector<rget_item_t> *vec) const {
+void intersecting_readgen_t::sindex_sort(
+    std::vector<rget_item_t> *,
+    const batchspec_t &) const {
     // No sorting required for intersection queries, since they don't
     // support any specific ordering.
 }
 
-boost::optional<key_range_t> intersecting_readgen_t::original_keyrange() const {
+key_range_t intersecting_readgen_t::original_keyrange(reql_version_t rv) const {
     // This is always universe for intersection reads.
     // The real query is in the query geometry.
-
-    // We can use whatever skey_version we want here because `universe`
-    // becomes the same key range anyway.
-    return datum_range_t::universe().to_sindex_keyrange(skey_version_t::post_1_16);
-}
-
-key_range_t intersecting_readgen_t::sindex_keyrange(
-    skey_version_t skey_version) const {
-    // This is always universe for intersection reads.
-    // The real query is in the query geometry.
-    return datum_range_t::universe().to_sindex_keyrange(skey_version);
+    return datum_range_t::universe().to_sindex_keyrange(rv);
 }
 
 boost::optional<std::string> intersecting_readgen_t::sindex_name() const {
@@ -777,7 +1155,7 @@ bool datum_stream_t::add_stamp(changefeed_stamp_t) {
     return false;
 }
 
-boost::optional<active_state_t> datum_stream_t::get_active_state() const {
+boost::optional<active_state_t> datum_stream_t::truncate_and_get_active_state() {
     return boost::none;
 }
 
@@ -817,7 +1195,7 @@ void datum_stream_t::add_grouping(transform_variant_t &&tv,
     add_transformation(std::move(tv), bt);
 }
 void datum_stream_t::check_not_grouped(const char *msg) {
-    rcheck(!is_grouped(), base_exc_t::GENERIC, msg);
+    rcheck(!is_grouped(), base_exc_t::LOGIC, msg);
 }
 
 std::vector<datum_t>
@@ -838,9 +1216,7 @@ datum_stream_t::next_batch(env_t *env, const batchspec_t &batchspec) {
     }
 }
 
-datum_t datum_stream_t::next(
-    env_t *env, const batchspec_t &batchspec) {
-
+datum_t datum_stream_t::next(env_t *env, const batchspec_t &batchspec) {
     profile::starter_t("Reading element from datum stream.", env->trace);
     if (batch_cache_index >= batch_cache.size()) {
         r_sanity_check(batch_cache_index == 0);
@@ -882,7 +1258,7 @@ eager_datum_stream_t::done_t eager_datum_stream_t::next_grouped_batch(
         }
         (*out)[datum_t()] = std::move(v);
         for (auto it = ops.begin(); it != ops.end(); ++it) {
-            (**it)(env, out, datum_t());
+            (**it)(env, out, []() { return datum_t(); });
         }
     }
     return done_t::NO;
@@ -1113,7 +1489,7 @@ slice_datum_stream_t::slice_datum_stream_t(
 std::vector<changespec_t> slice_datum_stream_t::get_changespecs() {
     if (left == 0) {
         auto subspecs = source->get_changespecs();
-        rcheck(subspecs.size() == 1, base_exc_t::GENERIC,
+        rcheck(subspecs.size() == 1, base_exc_t::LOGIC,
                "Cannot call `changes` on a slice of a union.");
         auto subspec = subspecs[0];
         auto *rspec = boost::get<changefeed::keyspec_t::range_t>(&subspec.keyspec.spec);
@@ -1121,7 +1497,7 @@ std::vector<changespec_t> slice_datum_stream_t::get_changespecs() {
             std::copy(transforms.begin(), transforms.end(),
                       std::back_inserter(rspec->transforms));
             rcheck(right <= static_cast<uint64_t>(std::numeric_limits<size_t>::max()),
-                   base_exc_t::GENERIC,
+                   base_exc_t::LOGIC,
                    strprintf("Cannot call `changes` on a slice "
                              "with size > %zu (got %" PRIu64 ").",
                              std::numeric_limits<size_t>::max(),
@@ -1381,8 +1757,8 @@ union_datum_stream_t::next_batch_impl(env_t *env, const batchspec_t &batchspec) 
                         ready_needed -= 1;
                         if (ready_needed != 0) continue;
                     } else {
-                        rfail(base_exc_t::GENERIC,
-                              "Internal Error: Unrecognized state string `%s`.",
+                        rfail(base_exc_t::INTERNAL,
+                              "Unrecognized state string `%s`.",
                               state.as_str().to_std().c_str());
                     }
                 }
@@ -1489,8 +1865,9 @@ range_datum_stream_t::next_raw_batch(env_t *, const batchspec_t &batchspec) {
     rcheck(!is_infinite_range
            || batchspec.get_batch_type() == batch_type_t::NORMAL
            || batchspec.get_batch_type() == batch_type_t::NORMAL_FIRST,
-           base_exc_t::GENERIC,
-           "Cannot use an infinite stream with an aggregation function (`reduce`, `count`, etc.) or coerce it to an array.");
+           base_exc_t::LOGIC,
+           "Cannot use an infinite stream with an aggregation function "
+           "(`reduce`, `count`, etc.) or coerce it to an array.");
 
     std::vector<datum_t> batch;
     // 500 is picked out of a hat for latency, primarily in the Data Explorer. If you
@@ -1505,7 +1882,7 @@ range_datum_stream_t::next_raw_batch(env_t *, const batchspec_t &batchspec) {
         // than 2^53 indicating we've reached the end of our infinite stream. This must
         // be checked before creating a `datum_t` as that does a similar check on
         // construction.
-        rcheck(risfinite(next), base_exc_t::GENERIC,
+        rcheck(risfinite(next), base_exc_t::LOGIC,
                "`range` out of safe double bounds.");
 
         batch.emplace_back(next);
@@ -1529,6 +1906,7 @@ map_datum_stream_t::map_datum_stream_t(
         backtrace_id_t bt)
     : eager_datum_stream_t(bt), streams(std::move(_streams)), func(std::move(_func)),
       union_type(feed_type_t::not_feed), is_array_map(true), is_infinite_map(true) {
+    args.reserve(streams.size());
     for (const auto &stream : streams) {
         is_array_map &= stream->is_array();
         union_type = union_of(union_type, stream->cfeed_type());
@@ -1541,24 +1919,33 @@ map_datum_stream_t::next_raw_batch(env_t *env, const batchspec_t &batchspec) {
     rcheck(!is_infinite_map
            || batchspec.get_batch_type() == batch_type_t::NORMAL
            || batchspec.get_batch_type() == batch_type_t::NORMAL_FIRST,
-           base_exc_t::GENERIC,
-           "Cannot use an infinite stream with an aggregation function (`reduce`, `count`, etc.) or coerce it to an array.");
+           base_exc_t::LOGIC,
+           "Cannot use an infinite stream with an aggregation function "
+           "(`reduce`, `count`, etc.) or coerce it to an array.");
 
     std::vector<datum_t> batch;
     batcher_t batcher = batchspec.to_batcher();
 
-    std::vector<datum_t> args;
-    args.reserve(streams.size());
     // We need a separate batchspec for the streams to prevent calling `stream->next`
     // with a `batch_type_t::TERMINAL` on an infinite stream.
     batchspec_t batchspec_inner = batchspec_t::default_for(batch_type_t::NORMAL);
     while (!is_exhausted()) {
-        args.clear();   // This prevents allocating a new vector every iteration.
-        for (const auto &stream : streams) {
-            args.push_back(stream->next(env, batchspec_inner));
+        while (args.size() < streams.size()) {
+            datum_t d = streams[args.size()]->next(env, batchspec_inner);
+            if (union_type == feed_type_t::not_feed) {
+                r_sanity_check(d.has());
+            } else {
+                if (!d.has()) {
+                    // Return with `args` partway full and continue next time
+                    // the client asks for a batch.
+                    return batch;
+                }
+            }
+            args.push_back(std::move(d));
         }
-
         datum_t datum = func->call(env, args)->as_datum();
+        r_sanity_check(datum.has());
+        args.clear();
         batcher.note_el(datum);
         batch.push_back(std::move(datum));
         if (batcher.should_send_batch()) {
@@ -1649,7 +2036,7 @@ std::vector<changespec_t> vector_datum_stream_t::get_changespecs() {
         return std::vector<changespec_t>{
             changespec_t(*changespec, counted_from_this())};
     } else {
-        rfail(base_exc_t::GENERIC, "%s", "Cannot call `changes` on this stream.");
+        rfail(base_exc_t::LOGIC, "%s", "Cannot call `changes` on this stream.");
     }
 }
 

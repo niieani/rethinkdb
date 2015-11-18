@@ -17,6 +17,11 @@ _, command_prefix, serve_options = scenario_common.parse_mode_flags(op.parse(sys
 r = utils.import_python_driver()
 dbName, tableName = utils.get_test_db_table()
 
+try:
+    xrange
+except NameError:
+    xrange = range
+
 print("Spinning up two servers (%.2fs)" % (time.time() - startTime))
 with driver.Cluster(initial_servers=['a', 'b'], output_folder='.', command_prefix=command_prefix, extra_options=serve_options) as cluster:
     cluster.check()
@@ -51,8 +56,8 @@ with driver.Cluster(initial_servers=['a', 'b'], output_folder='.', command_prefi
     assert N*2/fudge <= res["doc_count_estimates"][0] <= N*2*fudge
 
     r.db(dbName).table(tableName).reconfigure(shards=2, replicas=1).run(conn)
-    res = r.db(dbName).table(tableName).wait()["status_changes"][0]["new_val"].run(conn)
-    pprint.pprint(res)
+    r.db(dbName).table(tableName).wait().run(conn)
+    pprint.pprint(r.db(dbName).table(tableName).status().run(conn))
 
     res = r.db(dbName).table(tableName).info().run(conn)
     pprint.pprint(res)
@@ -61,8 +66,8 @@ with driver.Cluster(initial_servers=['a', 'b'], output_folder='.', command_prefi
 
     # Make sure that oversharding doesn't break distribution queries
     r.db(dbName).table(tableName).reconfigure(shards=2, replicas=2).run(conn)
-    res = r.db(dbName).table(tableName).wait()["status_changes"][0]["new_val"].run(conn)
-    pprint.pprint(res)
+    r.db(dbName).table(tableName).wait().run(conn)
+    pprint.pprint(r.db(dbName).table(tableName).status().run(conn))
 
     res = r.db(dbName).table(tableName).info().run(conn)
     pprint.pprint(res)

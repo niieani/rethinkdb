@@ -1,6 +1,7 @@
 // Copyright 2010-2014 RethinkDB, all rights reserved.
 #include "rdb_protocol/artificial_table/cfeed_backend.hpp"
 
+#include "clustering/administration/admin_op_exc.hpp"
 #include "concurrency/cross_thread_signal.hpp"
 
 /* We destroy the machinery if there have been no changefeeds for this many seconds */
@@ -50,13 +51,14 @@ cfeed_artificial_table_backend_t::~cfeed_artificial_table_backend_t() {
 
 bool cfeed_artificial_table_backend_t::read_changes(
     ql::env_t *env,
-    bool include_initial_vals,
+    bool include_initial,
     bool include_states,
+    ql::configured_limits_t limits,
     ql::backtrace_id_t bt,
     ql::changefeed::keyspec_t::spec_t &&spec,
     signal_t *interruptor,
     counted_t<ql::datum_stream_t> *cfeed_out,
-    std::string *error_out) {
+    admin_err_t *error_out) {
 
     guarantee(!begin_destruction_was_called);
     class visitor_t : public boost::static_visitor<bool> {
@@ -72,7 +74,9 @@ bool cfeed_artificial_table_backend_t::read_changes(
         }
     };
     if (!boost::apply_visitor(visitor_t(), spec)) {
-        *error_out = "System tables don't support changefeeds on `.limit()`.";
+        *error_out = admin_err_t{
+            "System tables don't support changefeeds on `.limit()`.",
+            query_state_t::FAILED};
         return false;
     }
     threadnum_t request_thread = get_thread_id();
@@ -86,7 +90,9 @@ bool cfeed_artificial_table_backend_t::read_changes(
     std::vector<ql::datum_t> initial_values;
     if (!machinery->get_initial_values(
             &machinery_lock, &initial_values, &interruptor2)) {
-        *error_out = "Failed to read initial values from system table.";
+        *error_out = admin_err_t{
+            "Failed to read initial values from system table.",
+            query_state_t::FAILED};
         return false;
     }
     /* We construct two `on_thread_t`s for a total of four thread switches. This is
@@ -95,14 +101,16 @@ bool cfeed_artificial_table_backend_t::read_changes(
     on_thread_t thread_switcher_2(request_thread);
     try {
         *cfeed_out = machinery->subscribe(
-            env, include_initial_vals,
+            env,
+            include_initial,
             include_states,
+            std::move(limits),
             std::move(spec),
             get_primary_key_name(),
             initial_values,
             bt);
     } catch (const ql::base_exc_t &e) {
-        *error_out = e.what();
+        *error_out = admin_err_t{e.what(), query_state_t::FAILED};
         return false;
     }
     return true;

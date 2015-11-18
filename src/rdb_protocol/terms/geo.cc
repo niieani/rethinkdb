@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 
 #include <limits>
 
@@ -25,16 +25,16 @@ namespace ql {
 `geo_exception_t`s. */
 class geo_term_t : public op_term_t {
 public:
-    geo_term_t(compile_env_t *env, const protob_t<const Term> &term,
+    geo_term_t(compile_env_t *env, const raw_term_t &term,
                const argspec_t &argspec, optargspec_t optargspec = optargspec_t({}))
         : op_term_t(env, term, argspec, optargspec) { }
 private:
-    // With the exception of r.point(), all geo terms are non-deterministic
-    // because they typically depend on floating point results that might
-    // diverge between machines / compilers / libraries.
-    // Even seemingly harmless things such as r.line() are affected because they
-    // perform geometric validation.
-    bool is_deterministic() const { return false; }
+    // With the exception of r.point(), all geo terms are only deterministic on a single
+    // server because they typically depend on floating point results that might diverge
+    // between machines / compilers / libraries.
+    // Even seemingly harmless things such as r.line() are affected because they perform
+    // geometric validation.
+    deterministic_t is_deterministic() const { return deterministic_t::single_server; }
     virtual scoped_ptr_t<val_t> eval_geo(
             scope_env_t *env, args_t *args, eval_flags_t flags) const = 0;
     scoped_ptr_t<val_t> eval_impl(
@@ -42,20 +42,20 @@ private:
         try {
             return eval_geo(env, args, flags);
         } catch (const geo_exception_t &e) {
-            rfail(base_exc_t::GENERIC, "%s", e.what());
+            rfail(base_exc_t::LOGIC, "%s", e.what());
         }
     }
 };
 
 class geo_obj_or_seq_op_term_t : public obj_or_seq_op_term_t {
 public:
-    geo_obj_or_seq_op_term_t(compile_env_t *env, protob_t<const Term> term,
+    geo_obj_or_seq_op_term_t(compile_env_t *env, const raw_term_t &term,
                              poly_type_t _poly_type, argspec_t argspec)
         : obj_or_seq_op_term_t(env, term, _poly_type, argspec,
                                std::set<std::string>{"GEOMETRY"}) { }
 private:
     // See comment in geo_term_t about non-determinism
-    bool is_deterministic() const { return false; }
+    deterministic_t is_deterministic() const { return deterministic_t::single_server; }
     virtual scoped_ptr_t<val_t> obj_eval_geo(
             scope_env_t *env, args_t *args, const scoped_ptr_t<val_t> &v0) const = 0;
     scoped_ptr_t<val_t> obj_eval(
@@ -63,14 +63,14 @@ private:
         try {
             return obj_eval_geo(env, args, v0);
         } catch (const geo_exception_t &e) {
-            rfail(base_exc_t::GENERIC, "%s", e.what());
+            rfail(base_exc_t::LOGIC, "%s", e.what());
         }
     }
 };
 
 class geojson_term_t : public geo_term_t {
 public:
-    geojson_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    geojson_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(1)) { }
 private:
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -82,7 +82,7 @@ private:
         datum_object_builder_t result(geo_json);
         bool dup = result.add(datum_t::reql_type_string,
                               datum_t(pseudo::geometry_string));
-        rcheck(!dup, base_exc_t::GENERIC, "GeoJSON object already had a "
+        rcheck(!dup, base_exc_t::LOGIC, "GeoJSON object already had a "
                                           "$reql_type$ field.");
         // Drop the `bbox` field in case it exists. We don't have any use for it.
         UNUSED bool had_bbox = result.delete_field("bbox");
@@ -97,7 +97,7 @@ private:
 // It's also deterministic.
 class to_geojson_term_t : public op_term_t {
 public:
-    to_geojson_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    to_geojson_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 private:
     scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -113,7 +113,7 @@ private:
 
 class point_term_t : public geo_term_t {
 public:
-    point_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    point_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2)) { }
 private:
     // point_term_t is deterministic because it doesn't perform any complex
@@ -124,7 +124,7 @@ private:
     // of the S2Point itself depends on the M_PI constant which could be system
     // dependent. Therefore if anything in validate_geojson() starts using
     // the constructed S2Point some day, determinism will need to be reconsidered.
-    bool is_deterministic() const { return true; }
+    deterministic_t is_deterministic() const { return deterministic_t::always; }
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
         double lon = args->arg(env, 0)->as_num();
         double lat = args->arg(env, 1)->as_num();
@@ -148,7 +148,7 @@ lon_lat_point_t parse_point_argument(const datum_t &point_datum) {
         // The argument must be a coordinate pair
         rcheck_target(&point_datum,
                       point_datum.arr_size() == 2,
-                      base_exc_t::GENERIC,
+                      base_exc_t::LOGIC,
                       strprintf("Expected point coordinate pair.  "
                                 "Got %zu element array instead of a 2 element one.",
                                 point_datum.arr_size()));
@@ -173,7 +173,7 @@ lon_lat_line_t parse_line_from_args(scope_env_t *env, args_t *args) {
 
 class line_term_t : public geo_term_t {
 public:
-    line_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    line_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2, -1)) { }
 private:
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -189,7 +189,7 @@ private:
 
 class polygon_term_t : public geo_term_t {
 public:
-    polygon_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    polygon_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(3, -1)) { }
 private:
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -205,7 +205,7 @@ private:
 
 class intersects_term_t : public geo_obj_or_seq_op_term_t {
 public:
-    intersects_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    intersects_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_obj_or_seq_op_term_t(env, term, poly_type_t::FILTER, argspec_t(2)) { }
 private:
     scoped_ptr_t<val_t> obj_eval_geo(
@@ -222,7 +222,7 @@ private:
 
 class includes_term_t : public geo_obj_or_seq_op_term_t {
 public:
-    includes_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    includes_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_obj_or_seq_op_term_t(env, term, poly_type_t::FILTER, argspec_t(2)) { }
 private:
     scoped_ptr_t<val_t> obj_eval_geo(
@@ -248,11 +248,11 @@ ellipsoid_spec_t pick_reference_ellipsoid(scope_env_t *env, args_t *args) {
             double f = geo_system_arg->as_datum().get_field("f").as_num();
             rcheck_target(geo_system_arg.get(),
                           a > 0.0,
-                          base_exc_t::GENERIC,
+                          base_exc_t::LOGIC,
                           "The equator radius `a` must be positive.");
             rcheck_target(geo_system_arg.get(),
                           f >= 0.0 && f < 1.0,
-                          base_exc_t::GENERIC,
+                          base_exc_t::LOGIC,
                           "The flattening `f` must be in the range [0, 1).");
             return ellipsoid_spec_t(a, f);
         } else {
@@ -262,7 +262,7 @@ ellipsoid_spec_t pick_reference_ellipsoid(scope_env_t *env, args_t *args) {
             } else if (v == "unit_sphere") {
                 return UNIT_SPHERE;
             } else {
-                rfail_target(geo_system_arg.get(), base_exc_t::GENERIC,
+                rfail_target(geo_system_arg.get(), base_exc_t::LOGIC,
                              "Unrecognized geo system \"%s\" (valid options: "
                              "\"WGS84\", \"unit_sphere\").", v.c_str());
             }
@@ -283,7 +283,7 @@ dist_unit_t pick_dist_unit(scope_env_t *env, args_t *args) {
 
 class distance_term_t : public geo_term_t {
 public:
-    distance_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    distance_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2), optargspec_t({"geo_system", "unit"})) { }
 private:
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -317,7 +317,7 @@ private:
 
 class circle_term_t : public geo_term_t {
 public:
-    circle_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    circle_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2),
           optargspec_t({"geo_system", "unit", "fill", "num_vertices"})) { }
 private:
@@ -336,7 +336,7 @@ private:
             num_vertices = num_vertices_arg->as_int<unsigned int>();
             rcheck_target(num_vertices_arg.get(),
                           num_vertices > 0,
-                          base_exc_t::GENERIC,
+                          base_exc_t::LOGIC,
                           "num_vertices must be positive.");
         }
 
@@ -363,17 +363,17 @@ private:
 
 class get_intersecting_term_t : public geo_term_t {
 public:
-    get_intersecting_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    get_intersecting_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2), optargspec_t({ "index" })) { }
 private:
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         scoped_ptr_t<val_t> query_arg = args->arg(env, 1);
         scoped_ptr_t<val_t> index = args->optarg(env, "index");
-        rcheck(index.has(), base_exc_t::GENERIC,
+        rcheck(index.has(), base_exc_t::LOGIC,
                "get_intersecting requires an index argument.");
         std::string index_str = index->as_str().to_std();
-        rcheck(index_str != table->get_pkey(), base_exc_t::GENERIC,
+        rcheck(index_str != table->get_pkey(), base_exc_t::LOGIC,
                "get_intersecting cannot use the primary index.");
         counted_t<datum_stream_t> stream = table->get_intersecting(
             env->env, query_arg->as_ptype(pseudo::geometry_string), index_str,
@@ -385,7 +385,7 @@ private:
 
 class fill_term_t : public geo_term_t {
 public:
-    fill_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    fill_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(1)) { }
 private:
     scoped_ptr_t<val_t> eval_geo(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -403,7 +403,7 @@ private:
 
 class get_nearest_term_t : public geo_term_t {
 public:
-    get_nearest_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    get_nearest_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2),
           optargspec_t({ "index", "max_results", "max_dist", "geo_system", "unit" })) { }
 private:
@@ -411,10 +411,10 @@ private:
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         scoped_ptr_t<val_t> center_arg = args->arg(env, 1);
         scoped_ptr_t<val_t> index = args->optarg(env, "index");
-        rcheck(index.has(), base_exc_t::GENERIC,
+        rcheck(index.has(), base_exc_t::LOGIC,
                "get_nearest requires an index argument.");
         std::string index_str = index->as_str().to_std();
-        rcheck(index_str != table->get_pkey(), base_exc_t::GENERIC,
+        rcheck(index_str != table->get_pkey(), base_exc_t::LOGIC,
                "get_nearest cannot use the primary index.");
         lon_lat_point_t center = parse_point_argument(center_arg->as_datum());
         ellipsoid_spec_t reference_ellipsoid = pick_reference_ellipsoid(env, args);
@@ -426,7 +426,7 @@ private:
                 convert_dist_unit(max_dist_arg->as_num(), dist_unit, dist_unit_t::M);
             rcheck_target(max_dist_arg,
                           max_dist > 0.0,
-                          base_exc_t::GENERIC,
+                          base_exc_t::LOGIC,
                           "max_dist must be positive.");
         }
         scoped_ptr_t<val_t> max_results_arg = args->optarg(env, "max_results");
@@ -435,7 +435,7 @@ private:
             max_results = max_results_arg->as_int();
             rcheck_target(max_results_arg,
                           max_results > 0,
-                          base_exc_t::GENERIC,
+                          base_exc_t::LOGIC,
                           "max_results must be positive.");
         }
 
@@ -449,7 +449,7 @@ private:
 
 class polygon_sub_term_t : public geo_term_t {
 public:
-    polygon_sub_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    polygon_sub_term_t(compile_env_t *env, const raw_term_t &term)
         : geo_term_t(env, term, argspec_t(2)) { }
 private:
     const datum_t check_arg(scoped_ptr_t<val_t> arg) const {
@@ -457,12 +457,12 @@ private:
 
         rcheck_target(arg.get(),
                       res.get_field("type").as_str() == "Polygon",
-                      base_exc_t::GENERIC,
+                      base_exc_t::LOGIC,
                       strprintf("Expected a Polygon but found a %s.",
                                 res.get_field("type").as_str().to_std().c_str()));
         rcheck_target(arg.get(),
                       res.get_field("coordinates").arr_size() <= 1,
-                      base_exc_t::GENERIC,
+                      base_exc_t::LOGIC,
                       "Expected a Polygon with only an outer shell.  "
                       "This one has holes.");
         return res;
@@ -503,55 +503,55 @@ private:
 
 
 counted_t<term_t> make_geojson_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<geojson_term_t>(env, term);
 }
 counted_t<term_t> make_to_geojson_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<to_geojson_term_t>(env, term);
 }
 counted_t<term_t> make_point_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<point_term_t>(env, term);
 }
 counted_t<term_t> make_line_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<line_term_t>(env, term);
 }
 counted_t<term_t> make_polygon_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<polygon_term_t>(env, term);
 }
 counted_t<term_t> make_intersects_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<intersects_term_t>(env, term);
 }
 counted_t<term_t> make_includes_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<includes_term_t>(env, term);
 }
 counted_t<term_t> make_distance_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<distance_term_t>(env, term);
 }
 counted_t<term_t> make_circle_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<circle_term_t>(env, term);
 }
 counted_t<term_t> make_get_intersecting_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<get_intersecting_term_t>(env, term);
 }
 counted_t<term_t> make_fill_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<fill_term_t>(env, term);
 }
 counted_t<term_t> make_get_nearest_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<get_nearest_term_t>(env, term);
 }
 counted_t<term_t> make_polygon_sub_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<polygon_sub_term_t>(env, term);
 }
 

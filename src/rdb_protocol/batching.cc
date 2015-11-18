@@ -10,7 +10,7 @@
 
 namespace ql {
 
-static const int64_t DEFAULT_MIN_ELS = 8;
+static const int64_t DEFAULT_MIN_ELS = 1;
 static const int64_t DEFAULT_FIRST_SCALEDOWN = 4;
 static const int64_t DEFAULT_MAX_SIZE = MEGABYTE;
 // The maximum duration of a batch in microseconds.
@@ -110,7 +110,7 @@ batchspec_t batchspec_t::user(batch_type_t batch_type, env_t *env) {
         rcheck_target(
             &max_dur_d,
             max_dur_d.as_num() < MAX_BATCH_SECONDS,
-            base_exc_t::GENERIC,
+            base_exc_t::LOGIC,
             strprintf("max_batch_seconds is too large (got `%"
                       PR_RECONSTRUCTABLE_DOUBLE "`, must be less than %"
                       PR_RECONSTRUCTABLE_DOUBLE ").",
@@ -118,7 +118,7 @@ batchspec_t batchspec_t::user(batch_type_t batch_type, env_t *env) {
         rcheck_target(
             &max_dur_d,
             max_dur_d.as_num() >= 0.0,
-            base_exc_t::GENERIC,
+            base_exc_t::LOGIC,
             strprintf("max_batch_seconds must be positive (got `%"
                       PR_RECONSTRUCTABLE_DOUBLE "`).",
                       max_dur_d.as_num()));
@@ -139,6 +139,11 @@ batchspec_t batchspec_t::user(batch_type_t batch_type, env_t *env) {
 
 batchspec_t batchspec_t::with_new_batch_type(batch_type_t new_batch_type) const {
     return batchspec_t(new_batch_type, min_els, max_els, max_size,
+                       first_scaledown_factor, max_dur, start_time);
+}
+
+batchspec_t batchspec_t::with_min_els(int64_t new_min_els) const {
+    return batchspec_t(batch_type, std::min(new_min_els, max_els), max_els, max_size,
                        first_scaledown_factor, max_dur, start_time);
 }
 
@@ -166,6 +171,12 @@ batchspec_t batchspec_t::with_at_most(uint64_t _max_els) const {
         first_scaledown_factor,
         max_dur,
         start_time);
+}
+
+batchspec_t batchspec_t::with_lazy_sorting_override(sorting_t sort) const {
+    batchspec_t ret = *this;
+    ret.lazy_sorting_override = sort;
+    return ret;
 }
 
 batchspec_t batchspec_t::scale_down(int64_t divisor) const {

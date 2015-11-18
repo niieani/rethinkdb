@@ -1,9 +1,12 @@
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef DEBUG_HPP_
 #define DEBUG_HPP_
 
 #include <string>
 
+#include "boost_utils.hpp"
 #include "containers/printf_buffer.hpp"
+#include "stl_utils.hpp"
 #include "time.hpp"
 
 #ifndef NDEBUG
@@ -26,13 +29,24 @@ void debugf_prefix_buf(printf_buffer_t *buf);
 void debugf_dump_buf(printf_buffer_t *buf);
 
 // Primitive debug_print declarations.
-void debug_print(printf_buffer_t *buf, int x);
-void debug_print(printf_buffer_t *buf, uint64_t x);
+template <class T>
+typename std::enable_if<std::is_arithmetic<T>::value>::type
+debug_print(printf_buffer_t *buf, T x) {
+    debug_print(buf, std::to_string(x));
+}
+
 void debug_print(printf_buffer_t *buf, const std::string& s);
 
 template <class T>
 void debug_print(printf_buffer_t *buf, T *ptr) {
     buf->appendf("%p", ptr);
+}
+
+template<class T>
+std::string debug_str(const T &t) {
+    printf_buffer_t buf;
+    debug_print(&buf, t);
+    return buf.c_str();
 }
 
 #ifndef NDEBUG
@@ -65,9 +79,6 @@ public:
 private:
     std::string message;
 };
-
-class Term;
-void pb_print(Term *t);
 
 // TODO: make this more efficient (use `clock_monotonic` and use a vector of
 // integers rather than accumulating a string).

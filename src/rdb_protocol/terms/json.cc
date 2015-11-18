@@ -1,4 +1,4 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "cjson/json.hpp"
 #include "rdb_protocol/op.hpp"
 #include "rdb_protocol/term.hpp"
@@ -12,7 +12,7 @@
 namespace ql {
 class json_term_t : public op_term_t {
 public:
-    json_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    json_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 
     scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -21,7 +21,7 @@ public:
         if (env->env->reql_version() < reql_version_t::v2_1) {
             const std::string std_data = data.to_std();
             scoped_cJSON_t cjson(cJSON_Parse(std_data.c_str()));
-            rcheck(cjson.get() != NULL, base_exc_t::GENERIC,
+            rcheck(cjson.get() != NULL, base_exc_t::LOGIC,
                    strprintf("Failed to parse \"%s\" as JSON.",
                      (data.size() > 40
                       ? (std_data.substr(0, 37) + "...").c_str()
@@ -29,13 +29,13 @@ public:
             return new_val(to_datum(cjson.get(), env->env->limits(),
                                     env->env->reql_version()));
         } else {
-            // Copy the string into a null-terminated c-string that we can write to,
-            // so we can use RapidJSON in-situ parsing (and at least avoid some additional
-            // copying).
+            // Copy the string into a null-terminated c-string that we can write
+            // to, so we can use RapidJSON in-situ parsing (and at least avoid
+            // some additional copying).
             std::vector<char> str_buf(data.size() + 1);
             memcpy(str_buf.data(), data.data(), data.size());
             for (size_t i = 0; i < data.size(); ++i) {
-                rcheck(str_buf[i] != '\0', base_exc_t::GENERIC,
+                rcheck(str_buf[i] != '\0', base_exc_t::LOGIC,
                        "Encountered unescaped null byte in JSON string.");
             }
             str_buf[data.size()] = '\0';
@@ -45,7 +45,7 @@ public:
             // `str_buf`. `str_buf`'s life time must be at least as long as `json`'s.
             json.ParseInsitu(str_buf.data());
 
-            rcheck(!json.HasParseError(), base_exc_t::GENERIC,
+            rcheck(!json.HasParseError(), base_exc_t::LOGIC,
                    strprintf("Failed to parse \"%s\" as JSON: %s",
                        (data.size() > 40
                         ? (data.to_std().substr(0, 37) + "...").c_str()
@@ -61,7 +61,7 @@ public:
 
 class to_json_string_term_t : public op_term_t {
 public:
-    to_json_string_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    to_json_string_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 
     scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -75,7 +75,8 @@ public:
             rapidjson::StringBuffer buffer;
             rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
             d.write_json(&writer);
-            return new_val(datum_t(datum_string_t(buffer.GetSize(), buffer.GetString())));
+            return new_val(
+                datum_t(datum_string_t(buffer.GetSize(), buffer.GetString())));
         }
     }
 
@@ -83,12 +84,12 @@ public:
 };
 
 counted_t<term_t> make_json_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<json_term_t>(env, term);
 }
 
 counted_t<term_t> make_to_json_string_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<to_json_string_term_t>(env, term);
 }
 } // namespace ql

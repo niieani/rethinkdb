@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef RDB_PROTOCOL_VAL_HPP_
 #define RDB_PROTOCOL_VAL_HPP_
 
@@ -22,7 +22,6 @@ namespace ql {
 
 class datum_t;
 class env_t;
-template <class> class protob_t;
 class scope_env_t;
 class term_t;
 class val_t;
@@ -33,13 +32,13 @@ class table_t : public single_threaded_countable_t<table_t>, public bt_rcheckabl
 public:
     table_t(counted_t<base_table_t> &&,
             counted_t<const db_t> db, const std::string &name,
-            bool use_outdated, backtrace_id_t src);
+            read_mode_t _read_mode, backtrace_id_t src);
     ql::datum_t get_id() const;
     const std::string &get_pkey() const;
     datum_t get_row(env_t *env, datum_t pval);
     counted_t<datum_stream_t> get_all(
             env_t *env,
-            datum_t value,
+            const datumspec_t &datumspec,
             const std::string &sindex_id,
             backtrace_id_t bt);
     counted_t<datum_stream_t> get_intersecting(
@@ -76,17 +75,6 @@ public:
         durability_requirement_t durability_requirement,
         return_changes_t return_changes);
 
-    MUST_USE bool sindex_create(
-        env_t *env, const std::string &name,
-        counted_t<const func_t> index_func, sindex_multi_bool_t multi,
-        sindex_geo_bool_t geo);
-    MUST_USE bool sindex_drop(env_t *env, const std::string &name);
-    MUST_USE sindex_rename_result_t sindex_rename(
-        env_t *env, const std::string &old_name,
-        const std::string &new_name, bool overwrite);
-    datum_t sindex_list(env_t *env);
-    datum_t sindex_status(env_t *env,
-        std::set<std::string> sindex);
     MUST_USE bool sync(env_t *env);
 
     /* `db` and `name` are mostly for display purposes, but some things like the
@@ -117,7 +105,7 @@ private:
     MUST_USE bool sync_depending_on_durability(
         env_t *env, durability_requirement_t durability_requirement);
 
-    bool use_outdated;
+    read_mode_t read_mode;
 };
 
 class table_slice_t
@@ -134,6 +122,7 @@ public:
     const boost::optional<std::string> &get_idx() const { return idx; }
     ql::changefeed::keyspec_t::range_t get_range_spec();
 private:
+    friend class info_term_t;
     friend class distinct_term_t;
     const counted_t<table_t> tbl;
     const boost::optional<std::string> idx;
@@ -164,7 +153,8 @@ public:
 
     virtual datum_t get() = 0;
     virtual counted_t<datum_stream_t> read_changes(
-        bool include_initial_vals,
+        bool include_initial,
+        configured_limits_t limits,
         const datum_t &squash,
         bool include_states) = 0;
     virtual datum_t replace(
@@ -261,7 +251,7 @@ public:
         int64_t i = as_int();
         T t = static_cast<T>(i);
         rcheck(static_cast<int64_t>(t) == i,
-               base_exc_t::GENERIC,
+               base_exc_t::LOGIC,
                strprintf("Integer too large: %" PRIi64, i));
         return t;
     }

@@ -1,4 +1,4 @@
-// Copyright 2010-2014 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #ifndef CONTAINERS_SEGMENTED_VECTOR_HPP_
 #define CONTAINERS_SEGMENTED_VECTOR_HPP_
 
@@ -81,6 +81,10 @@ public:
     void pop_back() {
         guarantee(size_ > 0);
         set_size(size_ - 1);
+    }
+
+    void clear() {
+        set_size(0);
     }
 
     void resize_with_zeros(size_t new_size) {

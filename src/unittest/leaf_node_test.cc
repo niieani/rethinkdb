@@ -6,66 +6,12 @@
 #include "containers/scoped.hpp"
 #include "repli_timestamp.hpp"
 #include "unittest/gtest.hpp"
+#include "unittest/unittest_utils.hpp"
 #include "utils.hpp"
+#include "unittest/btree_utils.hpp"
 
-
-struct short_value_t;
-
-class short_value_sizer_t : public value_sizer_t {
-public:
-    explicit short_value_sizer_t(max_block_size_t bs) : block_size_(bs) { }
-
-    int size(const void *value) const {
-        int x = *reinterpret_cast<const uint8_t *>(value);
-        return 1 + x;
-    }
-
-    bool fits(const void *value, int length_available) const {
-        return length_available > 0 && size(value) <= length_available;
-    }
-
-    int max_possible_size() const {
-        return 256;
-    }
-
-    block_magic_t btree_leaf_magic() const {
-        block_magic_t magic = { { 's', 'h', 'L', 'F' } };
-        return magic;
-    }
-
-    max_block_size_t block_size() const { return block_size_; }
-
-private:
-    max_block_size_t block_size_;
-
-    DISABLE_COPYING(short_value_sizer_t);
-};
 
 namespace unittest {
-
-class short_value_buffer_t {
-public:
-    explicit short_value_buffer_t(const short_value_t *v) {
-        memcpy(data_, v, reinterpret_cast<const uint8_t *>(v)[0] + 1);
-    }
-
-    explicit short_value_buffer_t(const std::string& v) {
-        rassert(v.size() <= 255);
-        data_[0] = v.size();
-        memcpy(data_ + 1, v.data(), v.size());
-    }
-
-    short_value_t *data() {
-        return reinterpret_cast<short_value_t *>(data_);
-    }
-
-    std::string as_str() const {
-        return std::string(data_ + 1, data_ + 1 + data_[0]);
-    }
-
-private:
-    uint8_t data_[256];
-};
 
 class LeafNodeTracker {
 public:
@@ -80,6 +26,7 @@ public:
     }
 
     leaf_node_t *node() { return node_.get(); }
+    value_sizer_t *sizer() { return &sizer_; }
 
     bool Insert(
             const store_key_t &key,
@@ -234,14 +181,20 @@ public:
             std::map<store_key_t, std::string>::iterator prev = p;
             --p;
             kv_.erase(prev);
+            EXPECT_TRUE(right->ShouldHave((*prev).first));
         }
 
-        ASSERT_EQ(key_to_unescaped_str(p->first), key_to_unescaped_str(median));
+        Verify();
+        right->Verify();
     }
 
     bool IsFull(const store_key_t& key, const std::string& value) {
         short_value_buffer_t value_buf(value);
         return leaf::is_full(&sizer_, node(), key.btree_key(), value_buf.data());
+    }
+
+    bool IsUnderfull() {
+        return leaf::is_underfull(&sizer_, node());
     }
 
     bool ShouldHave(const store_key_t& key) {
@@ -260,64 +213,38 @@ public:
         // leaf::print(stdout, &sizer_, node());
     }
 
-    class verify_receptor_t : public leaf::entry_reception_callback_t {
-    public:
-        verify_receptor_t() : got_lost_deletions_(false) { }
-
-        void lost_deletions() {
-            ASSERT_FALSE(got_lost_deletions_);
-            got_lost_deletions_ = true;
-        }
-
-        void deletion(UNUSED const btree_key_t *k, UNUSED repli_timestamp_t tstamp) {
-            ASSERT_TRUE(false);
-        }
-
-        void keys_values(const std::vector<const btree_key_t *> &ks, const std::vector<const void *> &values, const std::vector<repli_timestamp_t> &) {
-            ASSERT_TRUE(got_lost_deletions_);
-            for (size_t i = 0; i < ks.size(); ++i) {
-                const short_value_t *value = static_cast<const short_value_t *>(values[i]);
-
-                store_key_t k_buf(ks[i]);
-                short_value_buffer_t v_buf(value);
-                std::string v_str = v_buf.as_str();
-
-                ASSERT_TRUE(kv_map_.find(k_buf) == kv_map_.end());
-                kv_map_[k_buf] = v_str;
-            }
-        }
-
-        const std::map<store_key_t, std::string>& map() const { return kv_map_; }
-
-    private:
-        bool got_lost_deletions_;
-
-        std::map<store_key_t, std::string> kv_map_;
-    };
-
     void printmap(const std::map<store_key_t, std::string>& m) {
         for (std::map<store_key_t, std::string>::const_iterator p = m.begin(), q = m.end(); p != q; ++p) {
             printf("%s: %s;", key_to_debug_str(p->first).c_str(), p->second.c_str());
         }
     }
 
-
     void Verify() {
         // Of course, this will fail with rassert, not a gtest assertion.
         leaf::validate(&sizer_, node());
 
-        verify_receptor_t receptor;
+        std::map<store_key_t, std::string> leaf_guts;
         repli_timestamp_t max_possible_tstamp = { tstamp_counter_ };
-        leaf::dump_entries_since_time(&sizer_, node(), repli_timestamp_t::distant_past, max_possible_tstamp, &receptor);
+        leaf::visit_entries(&sizer_, node(), max_possible_tstamp,
+            [&](const btree_key_t *key, repli_timestamp_t, const void *value)
+                    -> continue_bool_t {
+                if (value != nullptr) {
+                    store_key_t k(key);
+                    short_value_buffer_t v(static_cast<const short_value_t *>(value));
+                    auto res = leaf_guts.insert(std::make_pair(k, v.as_str()));
+                    EXPECT_TRUE(res.second);
+                }
+                return continue_bool_t::CONTINUE;
+            });
 
-        if (receptor.map() != kv_) {
-            printf("receptor.map(): ");
-            printmap(receptor.map());
+        if (leaf_guts != kv_) {
+            printf("leaf_guts: ");
+            printmap(leaf_guts);
             printf("\nkv_: ");
             printmap(kv_);
             printf("\n");
         }
-        ASSERT_TRUE(receptor.map() == kv_);
+        ASSERT_TRUE(leaf_guts == kv_);
     }
 
 private:
@@ -417,45 +344,162 @@ TEST(LeafNodeTest, InsertRemove) {
     }
 }
 
+scoped_ptr_t<LeafNodeTracker> test_random_out_of_order(
+        int num_keys,
+        int num_ops,
+        bool random_tstamps,
+        store_key_t low_key = store_key_t::min(),
+        store_key_t high_key = store_key_t::max()) {
+
+    scoped_ptr_t<LeafNodeTracker> tracker(new LeafNodeTracker());
+
+    rng_t rng;
+
+    std::vector<store_key_t> key_pool(num_keys);
+    for (int i = 0; i < num_keys; ++i) {
+        do {
+            key_pool[i] = store_key_t(random_letter_string(&rng, 0, 159));
+        } while (key_pool[i].compare(low_key) < 0 || key_pool[i].compare(high_key) >= 0);
+    }
+
+    for (int i = 0; i < num_ops; ++i) {
+        const store_key_t &key = key_pool[rng.randint(num_keys)];
+        repli_timestamp_t tstamp;
+        if (random_tstamps) {
+            tstamp.longtime = rng.randint(num_ops);
+        } else {
+            tstamp.longtime = 0;
+        }
+
+        if (rng.randint(2) == 0) {
+            if (tracker->ShouldHave(key)) {
+                tracker->Remove(key);
+            }
+        } else {
+            std::string value = random_letter_string(&rng, 0, 159);
+            /* If the key doesn't fit, that's OK; it will just not insert it
+            and return `false`, which we ignore. */
+            tracker->Insert(key, value, tstamp);
+        }
+    }
+
+    return tracker;
+}
+
 TEST(LeafNodeTest, RandomOutOfOrder) {
     for (int try_num = 0; try_num < 10; ++try_num) {
-        LeafNodeTracker tracker;
+        test_random_out_of_order(10, 20000, true);
+    }
+}
 
-        rng_t rng;
+TEST(LeafNodeTest, RandomOutOfOrderLowTstamp) {
+    for (int try_num = 0; try_num < 10; ++try_num) {
+        // In contrast to RandomOutOfOrder, we use a fixed tstamp of 0
+        // to test some corner cases better.
+        test_random_out_of_order(50, 20000, false);
+    }
+}
 
-        const int num_keys = 10;
-        store_key_t key_pool[num_keys];
-        for (int i = 0; i < num_keys; ++i) {
-            key_pool[i].set_size(rng.randint(160));
-            char letter = 'a' + rng.randint(26);
-            for (int j = 0; j < key_pool[i].size(); ++j) {
-                key_pool[i].contents()[j] = letter;
+void make_node_underfull(LeafNodeTracker *tracker, rng_t *rng) {
+    leaf_node_t *node = tracker->node();
+    while (!tracker->IsUnderfull() ||
+           (node->num_pairs > 0 && rng->randint(2) == 0)) {
+        int chosen = rng->randint(node->num_pairs);
+        auto pair = *leaf_node_t::iterator(node, chosen);
+
+        // We might hit a removal entry; skip those.
+        if (tracker->ShouldHave(store_key_t(pair.first))) {
+            tracker->Remove(store_key_t(pair.first));
+        }
+    }
+}
+
+TEST(LeafNodeTest, RandomMerging) {
+    rng_t rng;
+
+    for (int try_num = 0; try_num < 100; ++try_num) {
+        // choose a random split key with some space on the ends for values
+        store_key_t split_key;
+        while (split_key.size() == 0 ||
+               split_key.contents()[0] == 'a' ||
+               split_key.contents()[0] == 'z') {
+            split_key = store_key_t(random_letter_string(&rng, 4, 8));
+        }
+
+        bool zero_timestamps = (try_num % 2) == 0;
+
+        scoped_ptr_t<LeafNodeTracker> left = test_random_out_of_order(
+                40, 200, zero_timestamps, store_key_t::min(), split_key);
+        scoped_ptr_t<LeafNodeTracker> right = test_random_out_of_order(
+                40, 200, zero_timestamps, split_key, store_key_t::max());
+
+        make_node_underfull(left.get(), &rng);
+        make_node_underfull(right.get(), &rng);
+
+        right->Merge(left.get());
+    }
+}
+
+TEST(LeafNodeTest, RandomSplitting) {
+    rng_t rng;
+
+    for (int try_num = 0; try_num < 100; ++try_num) {
+        bool zero_timestamps = (try_num % 2) == 0;
+
+        scoped_ptr_t<LeafNodeTracker> node = test_random_out_of_order(
+                40, 200, zero_timestamps);
+
+        // The node might not be full yet; add some values until it is.
+        while (true) {
+            store_key_t key(random_letter_string(&rng, 0, 160));
+            std::string value = random_letter_string(&rng, 0, 160);
+            if (node->IsFull(key, value)) {
+                break;
+            } else {
+                node->Insert(key, value);
             }
         }
 
-        const int num_ops = 10000;
-        for (int i = 0; i < num_ops; ++i) {
-            const store_key_t &key = key_pool[rng.randint(num_keys)];
-            repli_timestamp_t tstamp;
-            tstamp.longtime = rng.randint(num_ops);
+        LeafNodeTracker right;
+        node->Split(&right);
+    }
+}
 
-            if (rng.randint(2) == 1) {
-                std::string value;
-                int length = rng.randint(160);
-                char letter = 'a' + rng.randint(26);
-                for (int j = 0; j < length; ++j) {
-                    value.push_back(letter);
-                }
-                /* If the key doesn't fit, that's OK; it will just not insert it
-                and return `false`, which we ignore. */
-                tracker.Insert(key, value, tstamp);
+TEST(LeafNodeTest, DeletionTimestamp) {
+    LeafNodeTracker tracker;
+
+    rng_t rng;
+
+    /* The parameters for the initial setup phase are tuned so that the call to
+    `erase_deletions()` usually affects at least one deletion entry. */
+
+    std::vector<store_key_t> keys;
+    const int num_ops = 50;
+    for (int i = 0; i < num_ops; ++i) {
+        if (rng.randint(2) == 1 || keys.size() == 0) {
+            store_key_t key(std::string(rng.randint(10), 'a' + rng.randint(26)));
+            keys.push_back(key);
+            std::string value(rng.randint(10), 'a' + rng.randint(26));
+            tracker.Insert(key, value);
+        } else {
+            const store_key_t &key = keys.at(rng.randint(keys.size()));
+            if (tracker.ShouldHave(key) && rng.randint(4) != 0) {
+                tracker.Remove(key);
             } else {
-                if (tracker.ShouldHave(key)) {
-                    tracker.Remove(key);
-                }
+                std::string value(rng.randint(10), 'a' + rng.randint(26));
+                tracker.Insert(key, value);
             }
         }
     }
+
+    repli_timestamp_t max_ts = tracker.NextTimestamp();
+    repli_timestamp_t min_del_ts = leaf::min_deletion_timestamp(
+        tracker.sizer(), tracker.node(), max_ts);
+    ASSERT_LT(min_del_ts.longtime, max_ts.longtime - 10);
+    min_del_ts.longtime += (max_ts.longtime - min_del_ts.longtime) / 2;
+    leaf::erase_deletions(tracker.sizer(), tracker.node(), min_del_ts);
+
+    tracker.Verify();
 }
 
 TEST(LeafNodeTest, ZeroZeroMerging) {
@@ -557,6 +601,29 @@ TEST(LeafNodeTest, MergingWithHugeEntries) {
     for (int i = 0; i < 3; ++i) {
         left.Remove(store_key_t(std::string(250, 'a' + i)));
         right.Remove(store_key_t(std::string(250, 'n' + 1 + i)));
+    }
+
+    right.Merge(&left);
+}
+
+// A regression test for https://github.com/rethinkdb/rethinkdb/issues/4769
+TEST(LeafNodeTest, MergingRegression4769) {
+    LeafNodeTracker left;
+    LeafNodeTracker right;
+
+    // Fill the nodes with a bunch of deletion entries
+    for (int i = 0; i < 100; ++i) {
+        left.Insert(store_key_t(strprintf("a%d", i)), strprintf("A%d", i));
+        right.Insert(store_key_t(strprintf("b%d", i)), strprintf("B%d", i));
+        left.Remove(store_key_t(strprintf("a%d", i)));
+        right.Remove(store_key_t(strprintf("b%d", i)));
+    }
+
+    // Then insert a bunch of keys to push some of them over the timestamp
+    // cut-off point.
+    for (int i = 0; i < 20; ++i) {
+        left.Insert(store_key_t(strprintf("c%d", i)), strprintf("C%d", i));
+        right.Insert(store_key_t(strprintf("d%d", i)), strprintf("D%d", i));
     }
 
     right.Merge(&left);

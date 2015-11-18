@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2014 RethinkDB, all rights reserved.
+# Copyright 2014-2015 RethinkDB, all rights reserved.
 
 """Checks that the special `rethinkdb.table_config` and `rethinkdb.table_status` tables behave as expected."""
 
@@ -11,6 +11,11 @@ startTime = time.time()
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, 'common')))
 import driver, scenario_common, utils, vcoptparse
+
+try:
+    xrange
+except NameError:
+    xrange = range
 
 op = vcoptparse.OptParser()
 scenario_common.prepare_option_parser_mode_flags(op)
@@ -37,6 +42,8 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
             if set(e_shard["replicas"]) != set(f_shard["replicas"]):
                 return False
             if e_shard["primary_replica"] != f_shard["primary_replica"]:
+                return False
+            if e_shard.get("nonvoting_replicas", []) != f_shard["nonvoting_replicas"]:
                 return False
         return True
 
@@ -67,7 +74,7 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
                 if set(doc["server"] for doc in s_shard["replicas"]) != \
                         set(c_shard["replicas"]):
                     return False
-                if s_shard["primary_replica"] != c_shard["primary_replica"]:
+                if s_shard["primary_replicas"] != [c_shard["primary_replica"]]:
                     return False
                 if any(doc["state"] != "ready" for doc in s_shard["replicas"]):
                     return False
@@ -95,7 +102,7 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
             start_time = time.time()
             while not condition():
                 time.sleep(1)
-                if time.time() > start_time + 10:
+                if time.time() > start_time + 20:
                     raise RuntimeError("Out of time")
         except:
             config = list(r.db("rethinkdb").table("table_config").run(conn))
@@ -160,6 +167,9 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
         {"replicas": ["a", "b"], "primary_replica": "b"}
     ])
     test_shards([{"replicas": ["a"], "primary_replica": "a"}])
+    test_shards([
+        {"replicas": ["a", "b"], "primary_replica": "a", "nonvoting_replicas": ["b"]}])
+    test_shards([{"replicas": ["a"], "primary_replica": "a"}])
 
     print("Testing that table_config rejects invalid input (%.2fs)" % (time.time() - startTime))
     def test_invalid(conf):
@@ -173,6 +183,14 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
         [{"replicas": ["a"], "primary_replica": "a", "extra_key": "extra_value"}]}))
     test_invalid(r.row.merge({"shards": [{"replicas": [], "primary_replica": None}]}))
     test_invalid(r.row.merge({"shards": [{"replicas": ["a"], "primary_replica": "b"}]}))
+    test_invalid(r.row.merge({"shards": [
+        {"replicas": ["a"], "primary_replica": "a", "nonvoting_replicas": ["b"]}]}))
+    test_invalid(r.row.merge({"shards": [
+        {"replicas": ["a"], "primary_replica": "a", "nonvoting_replicas": ["a"]}]}))
+    test_invalid(r.row.merge({"shards": [
+        {"replicas": ["a"], "primary_replica": "a", "nonvoting_replicas": [3]}]}))
+    test_invalid(r.row.merge({"shards": [
+        {"replicas": ["a"], "primary_replica": "a", "nonvoting_replicas": 3}]}))
     test_invalid(r.row.merge(
         {"shards": [{"replicas": ["a"], "primary_replica": "b"},
                     {"replicas": ["b"], "primary_replica": "a"}]}))
@@ -183,6 +201,13 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
     test_invalid(r.row.without("primary_key"))
     test_invalid(r.row.without("db"))
     test_invalid(r.row.without("shards"))
+    test_invalid(r.row.merge({"durability": "hard as rock"}))
+    test_invalid(r.row.merge({"durability": 1}))
+    test_invalid(r.row.merge({"write_acks": [{"replicas": ["a"], "acks": "single"}]}))   # This was OK before 2.1
+    test_invalid(r.row.merge({"write_acks": 3}))
+    test_invalid(r.row.merge({"write_acks": "this is a string"}))
+    test_invalid(r.row.without("durability"))
+    test_invalid(r.row.without("write_acks"))
 
     print("Testing that table_status is not writable (%.2fs)" %
         (time.time() - startTime))
@@ -226,7 +251,7 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
         for i in xrange(10):
             try:
                 r.db(dbName).table(doc["name"]).insert({}).run(conn)
-            except r.RqlRuntimeError:
+            except r.ReqlRuntimeError:
                 time.sleep(1)
             else:
                 break
@@ -257,36 +282,38 @@ with driver.Cluster(initial_servers=['a', 'b', 'never_used'], output_folder='.',
     assert "baz" not in r.db(dbName).table_list().run(conn)
 
     print("Testing that identifier_format works (%.2fs)" % (time.time() - startTime))
-    a_uuid = r.db("rethinkdb").table("server_config") \
-              .filter({"name": "a"}).nth(0)["id"].run(conn)
-    db_uuid = r.db("rethinkdb").table("db_config") \
-               .filter({"name": "test"}).nth(0)["id"].run(conn)
+    a_uuid = r.db("rethinkdb").table("server_config").filter({"name": "a"}).nth(0)["id"].run(conn)
+    db_uuid = r.db("rethinkdb").table("db_config").filter({"name": "test"}).nth(0)["id"].run(conn)
     res = r.db("rethinkdb").table("table_config", identifier_format="uuid") \
            .insert({
                "name": "idf_test",
                "db": db_uuid,
                "shards": [{"replicas": [a_uuid], "primary_replica": a_uuid}]
-               }) \
-           .run(conn)
+            }).run(conn)
     assert res["inserted"] == 1, repr(res)
-    res = r.db("rethinkdb").table("table_config", identifier_format="uuid") \
-           .filter({"name": "idf_test"}).nth(0).run(conn)
-    assert res["shards"] == [{"replicas": [a_uuid], "primary_replica": a_uuid}], repr(res)
-    res = r.db("rethinkdb").table("table_config", identifier_format="name") \
-           .filter({"name": "idf_test"}).nth(0).run(conn)
-    assert res["shards"] == [{"replicas": ["a"], "primary_replica": "a"}], repr(res)
+    
+    res = r.db("rethinkdb").table("table_config", identifier_format="uuid").filter({"name": "idf_test"}).nth(0).run(conn)
+    assert "shards" in res, repr(res)
+    assert res["shards"] == [{"replicas": [a_uuid], "primary_replica": a_uuid, "nonvoting_replicas": []}], repr(res)
+    
+    res = r.db("rethinkdb").table("table_config", identifier_format="name").filter({"name": "idf_test"}).nth(0).run(conn)
+    assert res["shards"] == [{
+        "replicas": ["a"],
+        "primary_replica": "a",
+        "nonvoting_replicas": []
+        }], repr(res)
     r.db(dbName).table("idf_test").wait().run(conn)
-    res = r.db("rethinkdb").table("table_status", identifier_format="uuid") \
-           .filter({"name": "idf_test"}).nth(0).run(conn)
+    
+    res = r.db("rethinkdb").table("table_status", identifier_format="uuid").filter({"name": "idf_test"}).nth(0).run(conn)
     assert res["shards"] == [{
         "replicas": [{"server": a_uuid, "state": "ready"}],
-        "primary_replica": a_uuid
+        "primary_replicas": [a_uuid]
         }], repr(res)
-    res = r.db("rethinkdb").table("table_status", identifier_format="name") \
-           .filter({"name": "idf_test"}).nth(0).run(conn)
+    
+    res = r.db("rethinkdb").table("table_status", identifier_format="name").filter({"name": "idf_test"}).nth(0).run(conn)
     assert res["shards"] == [{
         "replicas": [{"server": "a", "state": "ready"}],
-        "primary_replica": "a"
+        "primary_replicas": ["a"]
         }], repr(res)
 
     print("Cleaning up (%.2fs)" % (time.time() - startTime))

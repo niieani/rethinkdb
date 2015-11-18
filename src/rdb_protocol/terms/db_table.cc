@@ -1,9 +1,10 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/terms.hpp"
 
 #include <map>
 #include <string>
 
+#include "clustering/administration/admin_op_exc.hpp"
 #include "containers/name_string.hpp"
 #include "rdb_protocol/datum_string.hpp"
 #include "rdb_protocol/op.hpp"
@@ -12,14 +13,13 @@
 
 namespace ql {
 
-name_string_t get_name(const scoped_ptr_t<val_t> &val, const char *type_str) {
-    r_sanity_check(val.has());
-    const datum_string_t &raw_name = val->as_str();
+name_string_t get_name(bt_rcheckable_t *target, const datum_string_t &raw_name,
+                       const char *type_str) {
     name_string_t name;
     bool assignment_successful = name.assign_value(raw_name);
-    rcheck_target(val.get(),
+    rcheck_target(target,
                   assignment_successful,
-                  base_exc_t::GENERIC,
+                  base_exc_t::LOGIC,
                   strprintf("%s name `%s` invalid (%s).",
                             type_str,
                             raw_name.to_std().c_str(),
@@ -27,73 +27,98 @@ name_string_t get_name(const scoped_ptr_t<val_t> &val, const char *type_str) {
     return name;
 }
 
+name_string_t get_name(const scoped_ptr_t<val_t> &name, const char *type_str) {
+    r_sanity_check(name.has());
+    return get_name(name.get(), name->as_str(), type_str);
+}
+
 void get_replicas_and_primary(const scoped_ptr_t<val_t> &replicas,
+                              const scoped_ptr_t<val_t> &nonvoting_replica_tags,
                               const scoped_ptr_t<val_t> &primary_replica_tag,
                               table_generate_config_params_t *params) {
     if (replicas.has()) {
         params->num_replicas.clear();
         datum_t datum = replicas->as_datum();
         if (datum.get_type() == datum_t::R_OBJECT) {
-            rcheck_target(replicas.get(), primary_replica_tag.has(), base_exc_t::GENERIC,
+            rcheck_target(replicas.get(), primary_replica_tag.has(), base_exc_t::LOGIC,
                 "`primary_replica_tag` must be specified when `replicas` is an OBJECT.");
             for (size_t i = 0; i < datum.obj_size(); ++i) {
                 std::pair<datum_string_t, datum_t> pair = datum.get_pair(i);
-                name_string_t name;
-                bool assignment_successful = name.assign_value(pair.first);
-                rcheck_target(replicas, assignment_successful, base_exc_t::GENERIC,
-                    strprintf("Server tag name `%s` invalid (%s).",
-                              pair.first.to_std().c_str(),
-                              name_string_t::valid_char_msg));
+                name_string_t name = get_name(replicas.get(), pair.first, "Server tag");
                 int64_t count = checked_convert_to_int(replicas.get(),
                                                        pair.second.as_num());
                 rcheck_target(replicas.get(), count >= 0,
-                    base_exc_t::GENERIC, "Can't have a negative number of replicas");
+                    base_exc_t::LOGIC, "Can't have a negative number of replicas");
                 size_t size_count = static_cast<size_t>(count);
                 rcheck_target(replicas.get(), static_cast<int64_t>(size_count) == count,
-                              base_exc_t::GENERIC,
+                              base_exc_t::LOGIC,
                               strprintf("Integer too large: %" PRIi64, count));
                 params->num_replicas.insert(std::make_pair(name, size_count));
             }
         } else if (datum.get_type() == datum_t::R_NUM) {
-            rcheck_target(replicas.get(), !primary_replica_tag.has(), base_exc_t::GENERIC,
+            rcheck_target(
+                replicas.get(), !primary_replica_tag.has(), base_exc_t::LOGIC,
                 "`replicas` must be an OBJECT if `primary_replica_tag` is specified.");
+            rcheck_target(
+                replicas.get(), !nonvoting_replica_tags.has(), base_exc_t::LOGIC,
+                "`replicas` must be an OBJECT if `nonvoting_replica_tags` is "
+                "specified.");
             size_t count = replicas->as_int<size_t>();
-            params->num_replicas.insert(std::make_pair(params->primary_replica_tag, count));
+            params->num_replicas.insert(
+                std::make_pair(params->primary_replica_tag, count));
         } else {
-            rfail_target(replicas, base_exc_t::GENERIC,
+            rfail_target(replicas, base_exc_t::LOGIC,
                 "Expected type OBJECT or NUMBER but found %s:\n%s",
                 datum.get_type_name().c_str(), datum.print().c_str());
         }
     }
 
+    if (nonvoting_replica_tags.has()) {
+        params->nonvoting_replica_tags.clear();
+        datum_t datum = nonvoting_replica_tags->as_datum();
+        rcheck_target(nonvoting_replica_tags.get(), datum.get_type() == datum_t::R_ARRAY,
+            base_exc_t::LOGIC, strprintf("Expected type ARRAY but found %s:\n%s",
+            datum.get_type_name().c_str(), datum.print().c_str()));
+        for (size_t i = 0; i < datum.arr_size(); ++i) {
+            datum_t tag = datum.get(i);
+            rcheck_target(
+                nonvoting_replica_tags.get(), tag.get_type() == datum_t::R_STR,
+                base_exc_t::LOGIC, strprintf("Expected type STRING but found %s:\n%s",
+                tag.get_type_name().c_str(), tag.print().c_str()));
+            params->nonvoting_replica_tags.insert(get_name(
+                nonvoting_replica_tags.get(), tag.as_str(), "Server tag"));
+        }
+    }
+
     if (primary_replica_tag.has()) {
-        params->primary_replica_tag = get_name(primary_replica_tag, "Server tag");
+        params->primary_replica_tag = get_name(
+            primary_replica_tag.get(), primary_replica_tag->as_str(), "Server tag");
     }
 }
 
 // Meta operations (BUT NOT TABLE TERMS) should inherit from this.
 class meta_op_term_t : public op_term_t {
 public:
-    meta_op_term_t(compile_env_t *env, const protob_t<const Term> term,
+    meta_op_term_t(compile_env_t *env, const raw_term_t &term,
                    argspec_t argspec, optargspec_t optargspec = optargspec_t({}))
         : op_term_t(env, term, std::move(argspec), std::move(optargspec)) { }
 
 private:
-    virtual bool is_deterministic() const { return false; }
+    virtual deterministic_t is_deterministic() const { return deterministic_t::no; }
 };
 
 class db_term_t : public meta_op_term_t {
 public:
-    db_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         name_string_t db_name = get_name(args->arg(env, 0), "Database");
         counted_t<const db_t> db;
-        std::string error;
-        if (!env->env->reql_cluster_interface()->db_find(db_name, env->env->interruptor,
-                &db, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+        admin_err_t error;
+        if (!env->env->reql_cluster_interface()->db_find(
+                db_name, env->env->interruptor, &db, &error)) {
+            REQL_RETHROW(error);
         }
         return new_val(db);
     }
@@ -102,17 +127,17 @@ private:
 
 class db_create_term_t : public meta_op_term_t {
 public:
-    db_create_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_create_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
             scope_env_t *env, args_t *args, eval_flags_t) const {
         name_string_t db_name = get_name(args->arg(env, 0), "Database");
-        std::string error;
+        admin_err_t error;
         ql::datum_t result;
         if (!env->env->reql_cluster_interface()->db_create(db_name,
                 env->env->interruptor, &result, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return new_val(result);
     }
@@ -121,10 +146,11 @@ private:
 
 class table_create_term_t : public meta_op_term_t {
 public:
-    table_create_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_create_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 2),
             optargspec_t({"primary_key", "shards", "replicas",
-                          "primary_replica_tag", "durability"})) { }
+                          "nonvoting_replica_tags", "primary_replica_tag",
+                          "durability"})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
             scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -134,13 +160,15 @@ private:
 
         // Parse the 'shards' optarg
         if (scoped_ptr_t<val_t> shards_optarg = args->optarg(env, "shards")) {
-            rcheck_target(shards_optarg, shards_optarg->as_int() > 0, base_exc_t::GENERIC,
+            rcheck_target(shards_optarg, shards_optarg->as_int() > 0, base_exc_t::LOGIC,
                           "Every table must have at least one shard.");
             config_params.num_shards = shards_optarg->as_int();
         }
 
-        // Parse the 'replicas' and 'primary_replica_tag' optargs
+        // Parse the 'replicas', 'nonvoting_replica_tags', and
+        // 'primary_replica_tag' optargs
         get_replicas_and_primary(args->optarg(env, "replicas"),
+                                 args->optarg(env, "nonvoting_replica_tags"),
                                  args->optarg(env, "primary_replica_tag"),
                                  &config_params);
 
@@ -167,12 +195,12 @@ private:
         }
 
         /* Create the table */
-        std::string error;
+        admin_err_t error;
         ql::datum_t result;
         if (!env->env->reql_cluster_interface()->table_create(tbl_name, db,
                 config_params, primary_key, durability,
                 env->env->interruptor, &result, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return new_val(result);
     }
@@ -181,18 +209,18 @@ private:
 
 class db_drop_term_t : public meta_op_term_t {
 public:
-    db_drop_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_drop_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
             scope_env_t *env, args_t *args, eval_flags_t) const {
         name_string_t db_name = get_name(args->arg(env, 0), "Database");
 
-        std::string error;
+        admin_err_t error;
         ql::datum_t result;
         if (!env->env->reql_cluster_interface()->db_drop(db_name,
                 env->env->interruptor, &result, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
 
         return new_val(result);
@@ -202,7 +230,7 @@ private:
 
 class table_drop_term_t : public meta_op_term_t {
 public:
-    table_drop_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_drop_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(
@@ -219,11 +247,11 @@ private:
             tbl_name = get_name(args->arg(env, 1), "Table");
         }
 
-        std::string error;
+        admin_err_t error;
         ql::datum_t result;
         if (!env->env->reql_cluster_interface()->table_drop(tbl_name, db,
                 env->env->interruptor, &result, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
 
         return new_val(result);
@@ -233,15 +261,15 @@ private:
 
 class db_list_term_t : public meta_op_term_t {
 public:
-    db_list_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    db_list_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(0)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *, eval_flags_t) const {
         std::set<name_string_t> dbs;
-        std::string error;
+        admin_err_t error;
         if (!env->env->reql_cluster_interface()->db_list(
                 env->env->interruptor, &dbs, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
 
         std::vector<datum_t> arr;
@@ -257,7 +285,7 @@ private:
 
 class table_list_term_t : public meta_op_term_t {
 public:
-    table_list_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_list_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(0, 1)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
@@ -271,10 +299,10 @@ private:
         }
 
         std::set<name_string_t> tables;
-        std::string error;
+        admin_err_t error;
         if (!env->env->reql_cluster_interface()->table_list(db,
                 env->env->interruptor, &tables, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
 
         std::vector<datum_t> arr;
@@ -289,14 +317,14 @@ private:
 
 class config_term_t : public meta_op_term_t {
 public:
-    config_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    config_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 1), optargspec_t({})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         scoped_ptr_t<val_t> target = args->arg(env, 0);
         scoped_ptr_t<val_t> selection;
         bool success;
-        std::string error;
+        admin_err_t error;
         /* Note that we always require an argument; we never take a default `db`
         argument. So `r.config()` is an error rather than the configuration for the
         current database. This is why we don't subclass from `table_or_db_meta_term_t`.
@@ -311,7 +339,7 @@ private:
                     table->db, name, backtrace(), env->env, &selection, &error);
         }
         if (!success) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return selection;
     }
@@ -320,17 +348,17 @@ private:
 
 class status_term_t : public meta_op_term_t {
 public:
-    status_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    status_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1, 1), optargspec_t({})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         name_string_t name = name_string_t::guarantee_valid(table->name.c_str());
-        std::string error;
+        admin_err_t error;
         scoped_ptr_t<val_t> selection;
         if (!env->env->reql_cluster_interface()->table_status(
                 table->db, name, backtrace(), env->env, &selection, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return selection;
     }
@@ -341,7 +369,7 @@ private:
 `reconfigure`, and `rebalance`. */
 class table_or_db_meta_term_t : public meta_op_term_t {
 public:
-    table_or_db_meta_term_t(compile_env_t *env, const protob_t<const Term> &term,
+    table_or_db_meta_term_t(compile_env_t *env, const raw_term_t &term,
                             optargspec_t &&optargs)
         /* None of the subclasses take positional arguments except for the table/db. */
         : meta_op_term_t(env, term, argspec_t(0, 1), std::move(optargs)) { }
@@ -376,7 +404,7 @@ private:
 
 class wait_term_t : public table_or_db_meta_term_t {
 public:
-    wait_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    wait_term_t(compile_env_t *env, const raw_term_t &term)
         : table_or_db_meta_term_t(env, term,
                                   optargspec_t({"timeout", "wait_for"})) { }
 private:
@@ -401,7 +429,7 @@ private:
             } else if (wait_for->as_str() == wait_all_str) {
                 readiness = table_readiness_t::finished;
             } else {
-                rfail_target(wait_for, base_exc_t::GENERIC,
+                rfail_target(wait_for, base_exc_t::LOGIC,
                              "Unknown table readiness state: '%s', must be one of "
                              "'%s', '%s', '%s', or '%s'",
                              wait_for->as_str().to_std().c_str(),
@@ -421,7 +449,7 @@ private:
         // Perform db or table wait
         ql::datum_t result;
         bool success;
-        std::string error;
+        admin_err_t error;
         try {
             if (static_cast<bool>(name_if_table)) {
                 success = env->env->reql_cluster_interface()->table_wait(db,
@@ -434,11 +462,11 @@ private:
             if (!timeout_timer.is_pulsed()) {
                 throw;
             }
-            rfail(base_exc_t::GENERIC, "Timed out while waiting for tables.");
+            rfail(base_exc_t::OP_FAILED, "Timed out while waiting for tables.");
         }
 
         if (!success) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return new_val(result);
     }
@@ -452,15 +480,16 @@ char const * const wait_term_t::wait_all_str = "all_replicas_ready";
 
 class reconfigure_term_t : public table_or_db_meta_term_t {
 public:
-    reconfigure_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    reconfigure_term_t(compile_env_t *env, const raw_term_t &term)
         : table_or_db_meta_term_t(env, term,
-            optargspec_t({"primary_replica_tag", "dry_run", "replicas", "shards"})) { }
+            optargspec_t({"dry_run", "emergency_repair", "nonvoting_replica_tags",
+                "primary_replica_tag", "replicas", "shards"})) { }
 private:
     scoped_ptr_t<val_t> required_optarg(scope_env_t *env,
                                         args_t *args,
                                         const char *name) const {
         scoped_ptr_t<val_t> result = args->optarg(env, name);
-        rcheck(result.has(), base_exc_t::GENERIC,
+        rcheck(result.has(), base_exc_t::LOGIC,
                strprintf("Missing required argument `%s`.", name));
         return result;
     }
@@ -469,20 +498,6 @@ private:
             scope_env_t *env, args_t *args, eval_flags_t,
             const counted_t<const ql::db_t> &db,
             const boost::optional<name_string_t> &name_if_table) const {
-        // Use the default primary_replica_tag, unless the optarg overwrites it
-        table_generate_config_params_t config_params =
-            table_generate_config_params_t::make_default();
-
-        // Parse the 'shards' optarg
-        scoped_ptr_t<val_t> shards_optarg = required_optarg(env, args, "shards");
-        rcheck_target(shards_optarg, shards_optarg->as_int() > 0, base_exc_t::GENERIC,
-                      "Every table must have at least one shard.");
-        config_params.num_shards = shards_optarg->as_int();
-
-        // Parse the 'replicas' and 'primary_replica_tag' optargs
-        get_replicas_and_primary(required_optarg(env, args, "replicas"),
-                                 args->optarg(env, "primary_replica_tag"),
-                                 &config_params);
 
         // Parse the 'dry_run' optarg
         bool dry_run = false;
@@ -490,30 +505,100 @@ private:
             dry_run = v->as_bool();
         }
 
-        bool success;
-        datum_t result;
-        std::string error;
-        /* Perform the operation */
-        if (static_cast<bool>(name_if_table)) {
-            success = env->env->reql_cluster_interface()->table_reconfigure(
-                    db, *name_if_table, config_params, dry_run,
-                    env->env->interruptor, &result, &error);
-        } else {
-            success = env->env->reql_cluster_interface()->db_reconfigure(
-                    db, config_params, dry_run, env->env->interruptor, &result, &error);
-        }
-        if (!success) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
-        }
+        /* Figure out whether we're doing a regular reconfiguration or an emergency
+        repair. */
+        scoped_ptr_t<val_t> emergency_repair = args->optarg(env, "emergency_repair");
+        if (!emergency_repair.has() ||
+                emergency_repair->as_datum() == ql::datum_t::null()) {
+            /* We're doing a regular reconfiguration. */
 
-        return new_val(result);
+            // Use the default primary_replica_tag, unless the optarg overwrites it
+            table_generate_config_params_t config_params =
+                table_generate_config_params_t::make_default();
+
+            // Parse the 'shards' optarg
+            scoped_ptr_t<val_t> shards_optarg = required_optarg(env, args, "shards");
+            rcheck_target(shards_optarg, shards_optarg->as_int() > 0,
+                          base_exc_t::LOGIC,
+                          "Every table must have at least one shard.");
+            config_params.num_shards = shards_optarg->as_int();
+
+            // Parse the 'replicas', 'nonvoting_replica_tags', and
+            // 'primary_replica_tag' optargs
+            get_replicas_and_primary(required_optarg(env, args, "replicas"),
+                                     args->optarg(env, "nonvoting_replica_tags"),
+                                     args->optarg(env, "primary_replica_tag"),
+                                     &config_params);
+
+            bool success;
+            datum_t result;
+            admin_err_t error;
+            /* Perform the operation */
+            if (static_cast<bool>(name_if_table)) {
+                success = env->env->reql_cluster_interface()->table_reconfigure(
+                        db, *name_if_table, config_params, dry_run,
+                        env->env->interruptor, &result, &error);
+            } else {
+                success = env->env->reql_cluster_interface()->db_reconfigure(
+                        db, config_params, dry_run, env->env->interruptor,
+                        &result, &error);
+            }
+            if (!success) {
+                REQL_RETHROW(error);
+            }
+            return new_val(result);
+
+        } else {
+            /* We're doing an emergency repair */
+
+            /* Parse `emergency_repair` to figure out which kind we're doing. */
+            datum_string_t emergency_repair_str = emergency_repair->as_str();
+            emergency_repair_mode_t mode;
+            if (emergency_repair_str == "_debug_recommit") {
+                mode = emergency_repair_mode_t::DEBUG_RECOMMIT;
+            } else if (emergency_repair_str == "unsafe_rollback") {
+                mode = emergency_repair_mode_t::UNSAFE_ROLLBACK;
+            } else if (emergency_repair_str == "unsafe_rollback_or_erase") {
+                mode = emergency_repair_mode_t::UNSAFE_ROLLBACK_OR_ERASE;
+            } else {
+                rfail_target(emergency_repair.get(), base_exc_t::LOGIC,
+                    "`emergency_repair` should be \"unsafe_rollback\" or "
+                    "\"unsafe_rollback_or_erase\"");
+            }
+
+            /* Make sure none of the optargs that are used with regular reconfigurations
+            are present, to avoid user confusion. */
+            if (args->optarg(env, "nonvoting_replica_tags").has() ||
+                    args->optarg(env, "primary_replica_tag").has() ||
+                    args->optarg(env, "replicas").has() ||
+                    args->optarg(env, "shards").has()) {
+                rfail(base_exc_t::LOGIC, "In emergency repair mode, you can't "
+                    "specify shards, replicas, etc.");
+            }
+
+            if (!static_cast<bool>(name_if_table)) {
+                rfail(base_exc_t::LOGIC, "Can't emergency repair an entire database "
+                    "at once; instead you should run `reconfigure()` on each table "
+                    "individually.");
+            }
+
+            datum_t result;
+            admin_err_t error;
+            bool success = env->env->reql_cluster_interface()->table_emergency_repair(
+                db, *name_if_table, mode, dry_run,
+                env->env->interruptor, &result, &error);
+            if (!success) {
+                REQL_RETHROW(error);
+            }
+            return new_val(result);
+        }
     }
     virtual const char *name() const { return "reconfigure"; }
 };
 
 class rebalance_term_t : public table_or_db_meta_term_t {
 public:
-    rebalance_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    rebalance_term_t(compile_env_t *env, const raw_term_t &term)
         : table_or_db_meta_term_t(env, term, optargspec_t({})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl_on_table_or_db(
@@ -522,7 +607,7 @@ private:
             const boost::optional<name_string_t> &name_if_table) const {
         ql::datum_t result;
         bool success;
-        std::string error;
+        admin_err_t error;
         if (static_cast<bool>(name_if_table)) {
             success = env->env->reql_cluster_interface()->table_rebalance(
                 db, *name_if_table, env->env->interruptor, &result, &error);
@@ -531,7 +616,7 @@ private:
                 db, env->env->interruptor, &result, &error);
         }
         if (!success) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return new_val(result);
     }
@@ -540,7 +625,7 @@ private:
 
 class sync_term_t : public meta_op_term_t {
 public:
-    sync_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    sync_term_t(compile_env_t *env, const raw_term_t &term)
         : meta_op_term_t(env, term, argspec_t(1)) { }
 
 private:
@@ -558,16 +643,37 @@ private:
 
 class table_term_t : public op_term_t {
 public:
-    table_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    table_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1, 2),
-          optargspec_t({ "use_outdated", "identifier_format" })) { }
+                    optargspec_t({"read_mode", "use_outdated", "identifier_format"})) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
-        scoped_ptr_t<val_t> t = args->optarg(env, "use_outdated");
-        bool use_outdated = t ? t->as_bool() : false;
+        read_mode_t read_mode = read_mode_t::SINGLE;
+        if (scoped_ptr_t<val_t> v = args->optarg(env, "use_outdated")) {
+            rfail(base_exc_t::LOGIC, "%s",
+                  "The `use_outdated` optarg is no longer supported.  "
+                  "Use the `read_mode` optarg instead.");
+        }
+        if (scoped_ptr_t<val_t> v = args->optarg(env, "read_mode")) {
+            const datum_string_t &str = v->as_str();
+            if (str == "majority") {
+                read_mode = read_mode_t::MAJORITY;
+            } else if (str == "single") {
+                read_mode = read_mode_t::SINGLE;
+            } else if (str == "outdated") {
+                read_mode = read_mode_t::OUTDATED;
+            } else if (str == "_debug_direct") {
+                read_mode = read_mode_t::DEBUG_DIRECT;
+            } else {
+                rfail(base_exc_t::LOGIC, "Read mode `%s` unrecognized (options "
+                      "are \"majority\", \"single\", and \"outdated\").",
+                      str.to_std().c_str());
+            }
+        }
 
         auto identifier_format =
-            boost::make_optional<admin_identifier_format_t>(false, admin_identifier_format_t());
+            boost::make_optional<admin_identifier_format_t>(
+                false, admin_identifier_format_t());
         if (scoped_ptr_t<val_t> v = args->optarg(env, "identifier_format")) {
             const datum_string_t &str = v->as_str();
             if (str == "name") {
@@ -575,7 +681,7 @@ private:
             } else if (str == "uuid") {
                 identifier_format = admin_identifier_format_t::uuid;
             } else {
-                rfail(base_exc_t::GENERIC, "Identifier format `%s` unrecognized "
+                rfail(base_exc_t::LOGIC, "Identifier format `%s` unrecognized "
                     "(options are \"name\" and \"uuid\").", str.to_std().c_str());
             }
         }
@@ -593,22 +699,22 @@ private:
             name = get_name(args->arg(env, 1), "Table");
         }
 
-        std::string error;
+        admin_err_t error;
         counted_t<base_table_t> table;
         if (!env->env->reql_cluster_interface()->table_find(name, db,
                 identifier_format, env->env->interruptor, &table, &error)) {
-            rfail(base_exc_t::GENERIC, "%s", error.c_str());
+            REQL_RETHROW(error);
         }
         return new_val(make_counted<table_t>(
-            std::move(table), db, name.str(), use_outdated, backtrace()));
+            std::move(table), db, name.str(), read_mode, backtrace()));
     }
-    virtual bool is_deterministic() const { return false; }
+    virtual deterministic_t is_deterministic() const { return deterministic_t::no; }
     virtual const char *name() const { return "table"; }
 };
 
 class get_term_t : public op_term_t {
 public:
-    get_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    get_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t>
@@ -624,7 +730,7 @@ private:
 
 class get_all_term_t : public op_term_t {
 public:
-    get_all_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    get_all_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2, -1), optargspec_t({ "index" })) { }
 private:
     datum_t get_key_arg(const scoped_ptr_t<val_t> &arg) const {
@@ -632,9 +738,12 @@ private:
 
         rcheck_target(arg,
                       !datum_arg.is_ptype(pseudo::geometry_string),
-                      base_exc_t::GENERIC,
+                      base_exc_t::LOGIC,
                       "Cannot use a geospatial index with `get_all`. "
                       "Use `get_intersecting` instead.");
+        rcheck_target(arg, datum_arg.get_type() != datum_t::R_NULL,
+                      base_exc_t::NON_EXISTENCE,
+                      "Keys cannot be NULL.");
         return datum_arg;
     }
 
@@ -643,97 +752,100 @@ private:
         counted_t<table_t> table = args->arg(env, 0)->as_table();
         scoped_ptr_t<val_t> index = args->optarg(env, "index");
         std::string index_str = index ? index->as_str().to_std() : table->get_pkey();
-        std::vector<counted_t<datum_stream_t> > streams;
+
+        std::map<datum_t, uint64_t> keys;
         for (size_t i = 1; i < args->num_args(); ++i) {
-            datum_t key = get_key_arg(args->arg(env, i));
-            counted_t<datum_stream_t> seq =
-                table->get_all(env->env, key, index_str, backtrace());
-            streams.push_back(seq);
+            auto key = get_key_arg(args->arg(env, i));
+            keys.insert(std::make_pair(std::move(key), 0)).first->second += 1;
         }
-        counted_t<datum_stream_t> stream = make_counted<union_datum_stream_t>(
-            env->env, std::move(streams), backtrace());
-        return new_val(make_counted<selection_t>(table, stream));
+        return new_val(
+            make_counted<selection_t>(
+                table,
+                table->get_all(env->env,
+                               datumspec_t(std::move(keys)),
+                               index_str,
+                               backtrace())));
     }
     virtual const char *name() const { return "get_all"; }
 };
 
 counted_t<term_t> make_db_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_term_t>(env, term);
 }
 
 counted_t<term_t> make_get_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<get_term_t>(env, term);
 }
 
 counted_t<term_t> make_get_all_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<get_all_term_t>(env, term);
 }
 
 counted_t<term_t> make_db_create_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_create_term_t>(env, term);
 }
 
 counted_t<term_t> make_db_drop_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_drop_term_t>(env, term);
 }
 
 counted_t<term_t> make_db_list_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<db_list_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_create_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_create_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_drop_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_drop_term_t>(env, term);
 }
 
 counted_t<term_t> make_table_list_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<table_list_term_t>(env, term);
 }
 
 counted_t<term_t> make_config_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<config_term_t>(env, term);
 }
 
 counted_t<term_t> make_status_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<status_term_t>(env, term);
 }
 
 counted_t<term_t> make_wait_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<wait_term_t>(env, term);
 }
 
 counted_t<term_t> make_reconfigure_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<reconfigure_term_t>(env, term);
 }
 
 counted_t<term_t> make_rebalance_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<rebalance_term_t>(env, term);
 }
 
 counted_t<term_t> make_sync_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<sync_term_t>(env, term);
 }
 

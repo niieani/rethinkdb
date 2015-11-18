@@ -30,6 +30,18 @@ private:
     DISABLE_COPYING(temp_file_t);
 };
 
+class temp_directory_t {
+public:
+    temp_directory_t();
+    ~temp_directory_t();
+    base_path_t path() const;
+
+private:
+    base_path_t directory;
+
+    DISABLE_COPYING(temp_directory_t);
+};
+
 void let_stuff_happen();
 
 std::set<ip_address_t> get_unittest_addresses();
@@ -38,6 +50,19 @@ void run_in_thread_pool(const std::function<void()> &fun, int num_workers = 1);
 
 read_t make_sindex_read(
     ql::datum_t key, const std::string &id);
+
+/* Easy way to make shard ranges. Examples:
+ - `quick_range("A-Z")` contains any key starting with a capital letter.
+ - `quick_range("A-M")` includes "Aardvark" and "Mammoth" but not "Quail".
+ - `quick_range("*-*")` is `key_range_t::universe()`.
+ - `quick_range("*-M")` and `quick_range("N-*")` are adjacent but do not overlap.
+The `quick_region()` variant just wraps the `key_range_t` in a `region_t`. */
+key_range_t quick_range(const char *bounds);
+region_t quick_region(const char *bounds);
+
+state_timestamp_t make_state_timestamp(int n);
+
+std::string random_letter_string(rng_t *rng, int min_length, int max_length);
 
 }  // namespace unittest
 
@@ -53,6 +78,5 @@ read_t make_sindex_read(
         ::unittest::run_in_thread_pool(run_##group##_##name, j);        \
     }                                                                   \
     TPTEST(group, name)
-
 
 #endif /* UNITTEST_UNITTEST_UTILS_HPP_ */

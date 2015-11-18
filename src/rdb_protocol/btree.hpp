@@ -8,7 +8,6 @@
 #include <utility>
 #include <vector>
 
-#include "backfill_progress.hpp"
 #include "btree/types.hpp"
 #include "concurrency/auto_drainer.hpp"
 #include "rdb_protocol/datum.hpp"
@@ -16,15 +15,14 @@
 #include "rdb_protocol/store.hpp"
 
 class btree_slice_t;
+enum class delete_mode_t;
 class deletion_context_t;
 class key_tester_t;
-class parallel_traversal_progress_t;
 template <class> class promise_t;
 struct rdb_value_t;
 class refcount_superblock_t;
 struct sindex_disk_info_t;
 
-class parallel_traversal_progress_t;
 
 bool btree_value_fits(max_block_size_t bs, int data_length, const rdb_value_t *value);
 
@@ -123,46 +121,22 @@ void rdb_set(const store_key_t &key, ql::datum_t data,
              point_write_response_t *response,
              rdb_modification_info_t *mod_info,
              profile::trace_t *trace,
-             promise_t<superblock_t *> *pass_back_superblock = NULL);
-
-class rdb_backfill_callback_t {
-public:
-    virtual void on_delete_range(
-        const key_range_t &range,
-        signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) = 0;
-    virtual void on_deletion(
-        const btree_key_t *key,
-        repli_timestamp_t recency,
-        signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) = 0;
-    virtual void on_keyvalues(
-        std::vector<backfill_atom_t> &&atoms,
-        signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) = 0;
-    virtual void on_sindexes(
-        const std::map<std::string, secondary_index_t> &sindexes,
-        signal_t *interruptor) THROWS_ONLY(interrupted_exc_t) = 0;
-protected:
-    virtual ~rdb_backfill_callback_t() { }
-};
-
-
-void rdb_backfill(btree_slice_t *slice, const key_range_t& key_range,
-                  repli_timestamp_t since_when, rdb_backfill_callback_t *callback,
-                  refcount_superblock_t *superblock,
-                  buf_lock_t *sindex_block,
-                  parallel_traversal_progress_t *p, signal_t *interruptor)
-    THROWS_ONLY(interrupted_exc_t);
-
+             promise_t<superblock_t *> *pass_back_superblock = nullptr);
 
 void rdb_delete(const store_key_t &key, btree_slice_t *slice, repli_timestamp_t
                 timestamp, real_superblock_t *superblock,
                 const deletion_context_t *deletion_context,
+                delete_mode_t delete_mode,
                 point_delete_response_t *response,
                 rdb_modification_info_t *mod_info,
-                profile::trace_t *trace);
+                profile::trace_t *trace,
+                promise_t<superblock_t *> *pass_back_superblock = nullptr);
 
 void rdb_rget_slice(
     btree_slice_t *slice,
+    const region_t &shard,
     const key_range_t &range,
+    const boost::optional<std::map<store_key_t, uint64_t> > &primary_keys,
     superblock_t *superblock,
     ql::env_t *ql_env,
     const ql::batchspec_t &batchspec,
@@ -174,8 +148,9 @@ void rdb_rget_slice(
 
 void rdb_rget_secondary_slice(
     btree_slice_t *slice,
-    const ql::datum_range_t &datum_range,
-    const region_t &sindex_region,
+    const region_t &shard,
+    const ql::datumspec_t &datumspec,
+    const key_range_t &sindex_range,
     sindex_superblock_t *superblock,
     ql::env_t *ql_env,
     const ql::batchspec_t &batchspec,
@@ -189,8 +164,9 @@ void rdb_rget_secondary_slice(
 
 void rdb_get_intersecting_slice(
     btree_slice_t *slice,
+    const region_t &shard,
     const ql::datum_t &query_geometry,
-    const region_t &sindex_region,
+    const key_range_t &sindex_range,
     sindex_superblock_t *superblock,
     ql::env_t *ql_env,
     const ql::batchspec_t &batchspec,
@@ -287,10 +263,19 @@ struct sindex_disk_info_t {
 
 void serialize_sindex_info(write_message_t *wm,
                            const sindex_disk_info_t &info);
-// Note that this will throw an exception if there's an error rather than just
-// crashing.
-void deserialize_sindex_info(const std::vector<char> &data,
-                             sindex_disk_info_t *info_out)
+
+// Note that the behavior for how this reacts to obsolete indexes is controlled
+// by the `outdated_cb`.  All other errors will throw an `archive_exc_t`.
+void deserialize_sindex_info(
+        const std::vector<char> &data,
+        sindex_disk_info_t *info_out,
+        const std::function<void(obsolete_reql_version_t)> &obsolete_cb);
+
+// Utility function that will call deserialize_sindex_info with an `obsolete_cb`
+// that will `fail_due_to_user_error` when an obsolete index is encountered.
+void deserialize_sindex_info_or_crash(
+        const std::vector<char> &data,
+        sindex_disk_info_t *info_out)
     THROWS_ONLY(archive_exc_t);
 
 /* An rdb_modification_cb_t is passed to BTree operations and allows them to
@@ -305,13 +290,13 @@ public:
     ~rdb_modification_report_cb_t();
 
     new_mutex_in_line_t get_in_line_for_sindex();
-    rwlock_in_line_t get_in_line_for_stamp();
+    rwlock_in_line_t get_in_line_for_cfeed_stamp();
 
     void on_mod_report(const rdb_modification_report_t &mod_report,
                        bool update_pkey_cfeeds,
                        new_mutex_in_line_t *sindex_spot,
                        rwlock_in_line_t *stamp_spot);
-    bool has_pkey_cfeeds();
+    bool has_pkey_cfeeds(const std::vector<store_key_t> &keys);
     void finish(btree_slice_t *btree, real_superblock_t *superblock);
 
 private:
@@ -342,11 +327,12 @@ void rdb_update_sindexes(
     index_vals_t *old_keys_out,
     index_vals_t *new_keys_out);
 
-void post_construct_secondary_indexes(
+void post_construct_secondary_index_range(
         store_t *store,
         const std::set<uuid_u> &sindexes_to_post_construct,
-        signal_t *interruptor,
-        parallel_traversal_progress_t *progress_tracker)
+        key_range_t *construction_range_inout,
+        const std::function<bool(int64_t)> &check_should_abort,
+        signal_t *interruptor)
     THROWS_ONLY(interrupted_exc_t);
 
 /* This deleter actually deletes the value and all associated blocks. */

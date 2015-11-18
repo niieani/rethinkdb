@@ -1,4 +1,4 @@
-// Copyright 2010-2013 RethinkDB, all rights reserved.
+// Copyright 2010-2015 RethinkDB, all rights reserved.
 #include "rdb_protocol/terms/terms.hpp"
 
 #include <cmath>
@@ -12,14 +12,13 @@ namespace ql {
 
 class arith_term_t : public op_term_t {
 public:
-    arith_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    arith_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1, -1)), namestr(0), op(0) {
-        int arithtype = term->type();
-        switch (arithtype) {
-        case Term_TermType_ADD: namestr = "ADD"; op = &arith_term_t::add; break;
-        case Term_TermType_SUB: namestr = "SUB"; op = &arith_term_t::sub; break;
-        case Term_TermType_MUL: namestr = "MUL"; op = &arith_term_t::mul; break;
-        case Term_TermType_DIV: namestr = "DIV"; op = &arith_term_t::div; break;
+        switch (static_cast<int>(term.type())) {
+        case Term::ADD: namestr = "ADD"; op = &arith_term_t::add; break;
+        case Term::SUB: namestr = "SUB"; op = &arith_term_t::sub; break;
+        case Term::MUL: namestr = "MUL"; op = &arith_term_t::mul; break;
+        case Term::DIV: namestr = "DIV"; op = &arith_term_t::div; break;
         default: unreachable();
         }
         guarantee(namestr && op);
@@ -89,7 +88,7 @@ private:
 
             datum_array_builder_t out(limits);
             const int64_t num_copies = num.as_int();
-            rcheck(num_copies >= 0, base_exc_t::GENERIC,
+            rcheck(num_copies >= 0, base_exc_t::LOGIC,
                    "Cannot multiply an ARRAY by a negative number.");
 
             for (int64_t j = 0; j < num_copies; ++j) {
@@ -109,7 +108,7 @@ private:
                 UNUSED const configured_limits_t &limits) const {
         lhs.check_type(datum_t::R_NUM);
         rhs.check_type(datum_t::R_NUM);
-        rcheck(rhs.as_num() != 0, base_exc_t::GENERIC, "Cannot divide by zero.");
+        rcheck(rhs.as_num() != 0, base_exc_t::LOGIC, "Cannot divide by zero.");
         // throws on non-finite values
         return datum_t(lhs.as_num() / rhs.as_num());
     }
@@ -122,15 +121,15 @@ private:
 
 class mod_term_t : public op_term_t {
 public:
-    mod_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    mod_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(2)) { }
 private:
     virtual scoped_ptr_t<val_t> eval_impl(scope_env_t *env, args_t *args, eval_flags_t) const {
         int64_t i0 = args->arg(env, 0)->as_int();
         int64_t i1 = args->arg(env, 1)->as_int();
-        rcheck(i1, base_exc_t::GENERIC, "Cannot take a number modulo 0.");
+        rcheck(i1, base_exc_t::LOGIC, "Cannot take a number modulo 0.");
         rcheck(!(i0 == std::numeric_limits<int64_t>::min() && i1 == -1),
-               base_exc_t::GENERIC,
+               base_exc_t::LOGIC,
                strprintf("Cannot take %" PRIi64 " mod %" PRIi64, i0, i1));
         return new_val(datum_t(static_cast<double>(i0 % i1)));
     }
@@ -139,7 +138,7 @@ private:
 
 class floor_term_t : public op_term_t {
 public:
-    floor_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    floor_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 
 private:
@@ -153,7 +152,7 @@ private:
 
 class ceil_term_t : public op_term_t {
 public:
-    ceil_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    ceil_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 
 private:
@@ -167,7 +166,7 @@ private:
 
 class round_term_t : public op_term_t {
 public:
-    round_term_t(compile_env_t *env, const protob_t<const Term> &term)
+    round_term_t(compile_env_t *env, const raw_term_t &term)
         : op_term_t(env, term, argspec_t(1)) { }
 
 private:
@@ -180,27 +179,27 @@ private:
 };
 
 counted_t<term_t> make_arith_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<arith_term_t>(env, term);
 }
 
 counted_t<term_t> make_mod_term(
-        compile_env_t *env, const protob_t<const Term> &term) {
+        compile_env_t *env, const raw_term_t &term) {
     return make_counted<mod_term_t>(env, term);
 }
 
 counted_t<term_t> make_floor_term(
-            compile_env_t *env, const protob_t<const Term> &term) {
+            compile_env_t *env, const raw_term_t &term) {
     return make_counted<floor_term_t>(env, term);
 }
 
 counted_t<term_t> make_ceil_term(
-            compile_env_t *env, const protob_t<const Term> &term) {
+            compile_env_t *env, const raw_term_t &term) {
     return make_counted<ceil_term_t>(env, term);
 }
 
 counted_t<term_t> make_round_term(
-            compile_env_t *env, const protob_t<const Term> &term) {
+            compile_env_t *env, const raw_term_t &term) {
     return make_counted<round_term_t>(env, term);
 }
 

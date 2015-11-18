@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 2010-2014 RethinkDB, all rights reserved.
+# Copyright 2010-2015 RethinkDB, all rights reserved.
 
 # This script detects the build settings local to the local build
 # environment and saves them in the config.mk file.
@@ -18,14 +18,14 @@ init () {
     min_coffee_version=1.7.0
     max_coffee_version=1.7.1
     min_browserify_version=3.0.0
-    max_browserify_version=3.24.13
+    max_browserify_version=12.0.1
     min_python_version=2.6.0
 
     must_fetch_list='bluebird v8'
     please_fetch_list="handlebars gtest re2 $must_fetch_list"
 
     optional_libs="gtest termcap boost_system ssl"
-    required_libs="protobuf icui18n icuuc icudata v8 re2 z crypto curl"
+    required_libs="protobuf v8 re2 z crypto curl"
     other_libs="unwind tcmalloc jemalloc"
     all_libs="$required_libs $optional_libs $other_libs"
     default_static="tcmalloc jemalloc"
@@ -79,9 +79,13 @@ configure () {
         *) error "unsupported operating system: $MACHINE" ;;
     esac
     case "${MACHINE%%-*}" in
-        x86_64|i?86) true ;;
-        arm*) final_warning="ARM support is still experimental";;
-        *) error "unsopported architecture: $MACHINE"
+        x86_64|i?86)
+            true ;;
+        arm*)
+            var_append LDFLAGS -ldl
+            final_warning="ARM support is still experimental" ;;
+        *)
+            error "unsupported architecture: $MACHINE"
     esac
     var M_LIBS -lm
     require "Build Architecture"
@@ -147,6 +151,7 @@ configure () {
 
     test_protobuf
     check_boost
+    check_openssl
     boolvar STATIC_V8 contains "$static_libs" v8
     boolvar ALLOW_FETCH $allow_fetch
     require Installation prefix
@@ -854,6 +859,13 @@ int main(){
     static_assert(JEMALLOC_VERSION_MAJOR >= 3, "jemalloc version 3 or above is required");
 }
 
+~openssl:
+
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
+#include <openssl/bn.h>
+int main(){ return 0; }
+
 ~'
 
 # An assoc-list of possible library aliases
@@ -1103,6 +1115,24 @@ check_boost () {
     fi
 }
 
+check_openssl () {
+    require "Test OpenSSL"
+    if contains "$please_fetch_list" openssl; then
+        fetch_lib openssl
+        return
+    fi
+    check_lib_compile "" openssl
+    if $can_show; then
+        if fetch_allowed openssl; then
+            fetch_lib openssl
+        else
+            show_no "openssl"
+        fi
+    else
+        empty_deps_lib openssl true
+    fi
+}
+
 # bin_pkg_name <bin>
 # The support package name that contains the application
 bin_pkg_name () {
@@ -1126,9 +1156,6 @@ lib_pkg_name () {
         boost_system) echo boost ;;
         crypto) echo openssl ;;
         ssl) echo openssl ;;
-        icui18n) echo icu ;;
-        icuuc) echo icu ;;
-        icudata) echo icu ;;
         *) echo "$1" ;;
     esac
 }
